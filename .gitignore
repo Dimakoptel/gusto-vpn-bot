@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+!.env.example
+
+# Docker
+docker-compose.override.yml
+docker-compose.*.yml
+*.log
+
+# VS Code
+.vscode/
+
+# Node
+node_modules/
+admin-panel/node_modules/
+
+# Build
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Backup
+backups/
+
+# Python cache
+*/__pycache__/

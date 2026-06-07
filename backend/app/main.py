@@ -65,15 +65,15 @@ app.add_middleware(
 )
 
 # API Routers
-app.include_router(users_router, prefix="/api/users", tags=["Users"])
-app.include_router(servers_router, prefix="/api/servers", tags=["Servers"])
-app.include_router(plans_router, prefix="/api/plans", tags=["Plans"])
-app.include_router(payments_router, prefix="/api/payments", tags=["Payments"])
-app.include_router(subscriptions_router, prefix="/api/subscriptions", tags=["Subscriptions"])
-app.include_router(referrals_router, prefix="/api/referrals", tags=["Referrals"])
-app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
-app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
-app.include_router(health_router, prefix="/health", tags=["Health"])
+app.include_router(users_router)
+app.include_router(servers_router)
+app.include_router(plans_router)
+app.include_router(payments_router)
+app.include_router(subscriptions_router)
+app.include_router(referrals_router)
+app.include_router(admin_router)
+app.include_router(settings_router)
+app.include_router(health_router)
 
 @app.get("/")
 async def root():

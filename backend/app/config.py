@@ -12,6 +12,17 @@ class CoreSettings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     CORS_ORIGINS: str = "*"
 
+    # Router defaults
+    ROUTER_LATENCY_WEIGHT: float = 0.35
+    ROUTER_LOAD_WEIGHT: float = 0.30
+    ROUTER_USERS_WEIGHT: float = 0.20
+    ROUTER_GEO_WEIGHT: float = 0.15
+    MAX_LATENCY_MS: float = 300.0
+
+    # Referral defaults
+    REFERRAL_LEVELS: dict = {1: 0.30, 2: 0.15, 3: 0.05}
+    REFERRAL_MIN_WITHDRAW: float = 500.0
+
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -21,6 +32,8 @@ def get_core_settings():
     return CoreSettings()
 
 core_settings = get_core_settings()
+# Backwards compatibility: some modules import `settings`
+settings = core_settings
 
 class DynamicSettingsProxy:
     """Proxy для динамических настроек из БД"""

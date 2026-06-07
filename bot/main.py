@@ -55,31 +55,32 @@ class BotConfig:
         url = backend_url or self.backend_url
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Get system settings (public endpoint)
-                resp = await client.get(f"{url}/api/settings/health")
-                if resp.status_code != 200:
-                    logger.error(f"❌ Backend unavailable: {resp.status_code}")
-                    return False
+                # Load bot settings from backend
+                resp = await client.get(f"{url}/settings/bot")
+                if resp.status_code == 200:
+                    settings = resp.json()
+                    self.bot_token = settings.get("bot_token", self.bot_token)
+                    self.admin_ids = settings.get("admin_ids", [])
+                    self.support_username = settings.get("support_username", "")
+                    self.welcome_message = settings.get("welcome_message", self.welcome_message)
+                    self.maintenance_mode = settings.get("maintenance_mode", False)
+                    self._initialized = True
+                    logger.info("✅ Loaded dynamic bot config from backend")
+                    return True
 
-                health = resp.json()
-                self.maintenance_mode = health.get("maintenance_mode", False)
+                if resp.status_code != 404:
+                    logger.warning(f"⚠️ Bot settings endpoint returned {resp.status_code}")
 
-                # Try to get full settings (may require auth, so catch 401)
-                try:
-                    settings_resp = await client.get(f"{url}/api/settings/")
-                    if settings_resp.status_code == 200:
-                        settings = settings_resp.json()
-                        self.admin_ids = settings.get("admin_ids", [])
-                        self.support_username = settings.get("support_username", "")
-                        self.welcome_message = settings.get("welcome_message", self.welcome_message)
-                        logger.info(f"✅ Loaded dynamic config: {len(self.admin_ids)} admins")
-                    elif settings_resp.status_code == 401:
-                        logger.warning("⚠️ Settings endpoint requires auth, using defaults for admin_ids")
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not load full settings: {e}")
+                # Fallback to health endpoint for maintenance status
+                health = await client.get(f"{url}/health")
+                if health.status_code == 200:
+                    health_data = health.json()
+                    self.maintenance_mode = health_data.get("maintenance_mode", False)
+                    self._initialized = True
+                    return True
 
-                self._initialized = True
-                return True
+                logger.error(f"❌ Backend unavailable: {health.status_code if health is not None else 'unknown'}")
+                return False
 
         except Exception as e:
             logger.error(f"❌ Failed to load config: {e}")
@@ -336,15 +337,26 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
     backend_url = os.getenv("BACKEND_URL", "http://gusto-backend:8000")
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/1")
 
-    if not bot_token:
-        logger.error("❌ BOT_TOKEN not set! Set environment variable BOT_TOKEN")
-        sys.exit(1)
-
     # Load dynamic config from backend
     config.backend_url = backend_url
     loaded = await config.load(backend_url)
     if not loaded:
         logger.warning("⚠️ Could not load dynamic config, using defaults")
+
+    if not bot_token:
+        logger.warning("⚠️ BOT_TOKEN not set; attempting to load from backend")
+        retries = 0
+        while not config.bot_token:
+            if retries > 0:
+                logger.info("⏳ Waiting for BOT_TOKEN to be set in backend config...")
+            await asyncio.sleep(10)
+            loaded = await config.load(backend_url)
+            if not loaded:
+                logger.warning("⚠️ Could not load backend config; retrying")
+            retries += 1
+
+        bot_token = config.bot_token
+        logger.info("✅ Loaded BOT_TOKEN from backend config")
 
     # Initialize global backend client
     global backend

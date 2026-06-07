@@ -18,6 +18,9 @@ async_session_maker = async_sessionmaker(
     autoflush=False
 )
 
+# Backwards-compatible alias expected by services
+AsyncSessionLocal = async_session_maker
+
 Base = declarative_base()
 
 # Redis client (async)

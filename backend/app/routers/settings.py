@@ -99,6 +99,16 @@ class SettingsResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class BotConfigResponse(BaseModel):
+    bot_token: Optional[str] = None
+    admin_ids: List[int] = []
+    support_username: Optional[str] = None
+    welcome_message: Optional[str] = None
+    maintenance_mode: bool = False
+
+    class Config:
+        from_attributes = True
+
 # === Endpoints ===
 
 @router.get("/", response_model=SettingsResponse)
@@ -202,6 +212,22 @@ async def update_system_settings(
     service = ConfigService(db)
     settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
+
+@router.get("/bot", response_model=BotConfigResponse)
+async def get_bot_config(
+    db: AsyncSession = Depends(get_db),
+):
+    """Получить конфигурацию бота для внутреннего запуска"""
+    service = ConfigService(db)
+    settings = await service.get_settings()
+    return {
+        "bot_token": settings.bot_token,
+        "admin_ids": settings.admin_ids or [],
+        "support_username": settings.support_username,
+        "welcome_message": settings.welcome_message,
+        "maintenance_mode": settings.maintenance_mode,
+    }
+
 
 @router.get("/payments/{provider}/config")
 async def get_payment_provider_config(

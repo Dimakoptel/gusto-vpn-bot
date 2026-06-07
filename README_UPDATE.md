@@ -80,7 +80,7 @@
 ---
 
 ### Этап 3: Платежные системы
-**Файл:** `backend/app/services/payments.py` + обновленный `backend/app/routers/payments.py`
+**Файл:** `backend/app/routers/payments.py`
 
 **Реализовано:**
 

@@ -1,8 +1,9 @@
 """Health Check Router"""
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime
 
 from app.database import get_db, engine
 from app.models.user import GustoUser
