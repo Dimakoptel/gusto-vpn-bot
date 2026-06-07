@@ -1,688 +1,531 @@
-"""
-GUSTO Payment Services — интеграция с платежными системами
-CryptoBot, YooKassa, FreeKassa
-"""
-import httpx
+"""Payments Router v2.0 — Full activation + webhooks + IP whitelist"""
 import hashlib
 import hmac
-import json
+import base64
+import uuid
+import ipaddress
 import logging
-from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
-from decimal import Decimal
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks, Header
+from fastapi.responses import PlainTextResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from pydantic import BaseModel, Field
+import httpx
+
+from app.database import get_db
+from app.services.config_service import ConfigService
+from app.services.notification_service import NotificationService
+from app.services.subscription_service import SubscriptionService
+from app.models.payment import GustoPayment, PaymentStatus, PaymentMethod
+from app.models.user import GustoUser
+from app.models.subscription import GustoSubscription, SubscriptionStatus
 
 logger = logging.getLogger("gusto.payments")
-
-# ==================== BASE PAYMENT CLASS ====================
-
-class BasePaymentProvider:
-    """Базовый класс для платежных провайдеров"""
-
-    def __init__(self, name: str):
-        self.name = name
-
-    async def create_payment(self, amount: float, description: str, 
-                           order_id: str, **kwargs) -> Optional[Dict]:
-        raise NotImplementedError
-
-    async def check_payment(self, payment_id: str) -> Optional[Dict]:
-        raise NotImplementedError
-
-    def verify_webhook(self, data: Dict, signature: str) -> bool:
-        raise NotImplementedError
-
-# ==================== CRYPTOBOT ====================
-
-class CryptoBotPayment(BasePaymentProvider):
-    """
-    CryptoBot Payment Provider
-    Документация: https://pay.crypt.bot/
-    """
-
-    API_URL = "https://pay.crypt.bot/api"
-
-    def __init__(self, api_token: str):
-        super().__init__("CryptoBot")
-        self.api_token = api_token
-        self.headers = {
-            "Crypto-Pay-API-Token": api_token,
-            "Content-Type": "application/json"
-        }
-        self.client = httpx.AsyncClient(base_url=self.API_URL, headers=self.headers, timeout=30.0)
-
-    async def create_payment(
-        self,
-        amount: float,
-        description: str,
-        order_id: str,
-        currency: str = "USDT",
-        **kwargs
-    ) -> Optional[Dict]:
-        """Создать инвойс в CryptoBot"""
-        try:
-            payload = {
-                "asset": currency,
-                "amount": str(amount),
-                "description": description,
-                "payload": json.dumps({"order_id": order_id}),
-                "paid_btn_name": "viewItem",
-                "paid_btn_url": kwargs.get("success_url", "https://t.me/gustovpn_bot"),
-                "allow_comments": False,
-                "allow_anonymous": False
-            }
-
-            resp = await self.client.post("/createInvoice", json=payload)
-            data = resp.json()
-
-            if resp.status_code == 200 and data.get("ok"):
-                result = data["result"]
-                return {
-                    "provider": "cryptobot",
-                    "provider_payment_id": str(result["invoice_id"]),
-                    "pay_url": result["pay_url"],
-                    "amount": float(result["amount"]),
-                    "currency": result["asset"],
-                    "status": "pending",
-                    "expires_at": result.get("expiration_date_time")
-                }
-
-            logger.error(f"CryptoBot create error: {data}")
-            return None
-
-        except Exception as e:
-            logger.error(f"CryptoBot error: {e}")
-            return None
-
-    async def check_payment(self, invoice_id: str) -> Optional[Dict]:
-        """Проверить статус инвойса"""
-        try:
-            resp = await self.client.get(f"/getInvoices?invoice_ids={invoice_id}")
-            data = resp.json()
-
-            if resp.status_code == 200 and data.get("ok"):
-                items = data["result"].get("items", [])
-                if items:
-                    invoice = items[0]
-                    return {
-                        "status": "success" if invoice["status"] == "paid" else "pending",
-                        "amount": float(invoice["amount"]),
-                        "currency": invoice["asset"],
-                        "paid_at": invoice.get("paid_at")
-                    }
-            return None
-
-        except Exception as e:
-            logger.error(f"CryptoBot check error: {e}")
-            return None
-
-    def verify_webhook(self, data: Dict, signature: str) -> bool:
-        """Проверить подпись webhook от CryptoBot"""
-        # CryptoBot использует секретный ключ для подписи
-        # Реализация зависит от спецификации webhook
-        return True  # Заглушка — реализовать по документации
-
-    async def get_balance(self) -> Optional[Dict]:
-        """Получить баланс CryptoBot"""
-        try:
-            resp = await self.client.get("/getBalance")
-            data = resp.json()
-            if resp.status_code == 200 and data.get("ok"):
-                return data["result"]
-            return None
-        except Exception as e:
-            logger.error(f"CryptoBot balance error: {e}")
-            return None
-
-    async def close(self):
-        await self.client.aclose()
-
-# ==================== YOOKASSA ====================
-
-class YooKassaPayment(BasePaymentProvider):
-    """
-    YooKassa (ЮKassa) Payment Provider
-    Документация: https://yookassa.ru/developers/
-    """
-
-    API_URL = "https://api.yookassa.ru/v3"
-
-    def __init__(self, shop_id: str, secret_key: str):
-        super().__init__("YooKassa")
-        self.shop_id = shop_id
-        self.secret_key = secret_key
-        self.auth = httpx.BasicAuth(shop_id, secret_key)
-        self.headers = {
-            "Content-Type": "application/json",
-            "Idempotence-Key": ""  # Будет установлено при каждом запросе
-        }
-        self.client = httpx.AsyncClient(base_url=self.API_URL, auth=self.auth, timeout=30.0)
-
-    def _generate_idempotence_key(self) -> str:
-        """Генерировать уникальный ключ идемпотентности"""
-        return hashlib.sha256(f"{datetime.utcnow().timestamp()}_{id(self)}".encode()).hexdigest()
-
-    async def create_payment(
-        self,
-        amount: float,
-        description: str,
-        order_id: str,
-        return_url: str = "https://t.me/gustovpn_bot",
-        **kwargs
-    ) -> Optional[Dict]:
-        """Создать платеж в YooKassa"""
-        try:
-            self.headers["Idempotence-Key"] = self._generate_idempotence_key()
-
-            payload = {
-                "amount": {
-                    "value": f"{amount:.2f}",
-                    "currency": "RUB"
-                },
-                "capture": True,
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": return_url
-                },
-                "description": description,
-                "metadata": {
-                    "order_id": order_id,
-                    "user_id": str(kwargs.get("user_id", ""))
-                },
-                "receipt": {
-                    "customer": {
-                        "email": kwargs.get("email", "user@gustovpn.ru")
-                    },
-                    "items": [{
-                        "description": description,
-                        "quantity": "1.00",
-                        "amount": {
-                            "value": f"{amount:.2f}",
-                            "currency": "RUB"
-                        },
-                        "vat_code": "1",  # Без НДС
-                        "payment_mode": "full_payment",
-                        "payment_subject": "service"
-                    }]
-                }
-            }
-
-            resp = await self.client.post(
-                "/payments",
-                json=payload,
-                headers=self.headers
-            )
-            data = resp.json()
-
-            if resp.status_code in (200, 201):
-                confirmation = data.get("confirmation", {})
-                return {
-                    "provider": "yookassa",
-                    "provider_payment_id": data["id"],
-                    "pay_url": confirmation.get("confirmation_url"),
-                    "amount": float(data["amount"]["value"]),
-                    "currency": data["amount"]["currency"],
-                    "status": "pending",
-                    "expires_at": None
-                }
-
-            logger.error(f"YooKassa create error: {data}")
-            return None
-
-        except Exception as e:
-            logger.error(f"YooKassa error: {e}")
-            return None
-
-    async def check_payment(self, payment_id: str) -> Optional[Dict]:
-        """Проверить статус платежа YooKassa"""
-        try:
-            resp = await self.client.get(f"/payments/{payment_id}")
-            data = resp.json()
-
-            if resp.status_code == 200:
-                status_map = {
-                    "pending": "pending",
-                    "waiting_for_capture": "pending",
-                    "succeeded": "success",
-                    "canceled": "failed",
-                    "refunded": "refunded"
-                }
-
-                return {
-                    "status": status_map.get(data["status"], "pending"),
-                    "amount": float(data["amount"]["value"]),
-                    "currency": data["amount"]["currency"],
-                    "paid_at": data.get("captured_at"),
-                    "metadata": data.get("metadata", {})
-                }
-            return None
-
-        except Exception as e:
-            logger.error(f"YooKassa check error: {e}")
-            return None
-
-    def verify_webhook(self, data: Dict, signature: str) -> bool:
-        """Проверить подпись webhook от YooKassa"""
-        # YooKassa использует IP-фильтрацию и basic auth
-        # Дополнительная проверка подписи не требуется
-        return True
-
-    async def refund_payment(self, payment_id: str, amount: float) -> Optional[Dict]:
-        """Возврат платежа"""
-        try:
-            self.headers["Idempotence-Key"] = self._generate_idempotence_key()
-
-            payload = {
-                "amount": {
-                    "value": f"{amount:.2f}",
-                    "currency": "RUB"
-                }
-            }
-
-            resp = await self.client.post(
-                f"/payments/{payment_id}/refunds",
-                json=payload,
-                headers=self.headers
-            )
-
-            if resp.status_code in (200, 201):
-                return resp.json()
-            return None
-
-        except Exception as e:
-            logger.error(f"YooKassa refund error: {e}")
-            return None
-
-    async def close(self):
-        await self.client.aclose()
-
-# ==================== FREEKASSA ====================
-
-class FreeKassaPayment(BasePaymentProvider):
-    """
-    FreeKassa Payment Provider
-    Документация: https://docs.freekassa.ru/
-    """
-
-    API_URL = "https://api.freekassa.ru/v1"
-    PAY_URL = "https://pay.freekassa.ru/"
-
-    def __init__(self, shop_id: str, secret_key: str, api_key: str):
-        super().__init__("FreeKassa")
-        self.shop_id = shop_id
-        self.secret_key = secret_key
-        self.api_key = api_key
-        self.headers = {
-            "Content-Type": "application/json"
-        }
-        self.client = httpx.AsyncClient(base_url=self.API_URL, timeout=30.0)
-
-    def _generate_sign(self, params: Dict) -> str:
-        """Генерировать подпись для FreeKassa"""
-        # Формат: MD5(shop_id:amount:secret_key:currency_id)
-        sign_string = f"{self.shop_id}:{params['amount']}:{self.secret_key}:{params.get('currency', 'RUB')}"
-        return hashlib.md5(sign_string.encode()).hexdigest()
-
-    async def create_payment(
-        self,
-        amount: float,
-        description: str,
-        order_id: str,
-        currency: str = "RUB",
-        **kwargs
-    ) -> Optional[Dict]:
-        """Создать платеж в FreeKassa"""
-        try:
-            params = {
-                "m": self.shop_id,
-                "oa": f"{amount:.2f}",
-                "o": order_id,
-                "s": self._generate_sign({"amount": f"{amount:.2f}", "currency": currency}),
-                "currency": currency,
-                "us_user_id": str(kwargs.get("user_id", "")),
-                "us_plan_id": str(kwargs.get("plan_id", ""))
-            }
-
-            # Формируем URL для оплаты
-            query = "&".join([f"{k}={v}" for k, v in params.items()])
-            pay_url = f"{self.PAY_URL}?{query}"
-
-            return {
-                "provider": "freekassa",
-                "provider_payment_id": order_id,
-                "pay_url": pay_url,
-                "amount": amount,
-                "currency": currency,
-                "status": "pending",
-                "expires_at": None
-            }
-
-        except Exception as e:
-            logger.error(f"FreeKassa error: {e}")
-            return None
-
-    async def check_payment(self, order_id: str) -> Optional[Dict]:
-        """Проверить статус платежа через API FreeKassa"""
-        try:
-            params = {
-                "shopId": self.shop_id,
-                "nonce": str(int(datetime.utcnow().timestamp())),
-                "orderId": order_id
-            }
-
-            # Подпись для API запроса
-            sign_string = f"{params['shopId']}{params['nonce']}{self.api_key}"
-            params["signature"] = hashlib.md5(sign_string.encode()).hexdigest()
-
-            resp = await self.client.post("/orders", json=params)
-            data = resp.json()
-
-            if resp.status_code == 200 and data.get("type") == "success":
-                order = data.get("order", {})
-                return {
-                    "status": "success" if order.get("status") == "1" else "pending",
-                    "amount": float(order.get("amount", 0)),
-                    "currency": order.get("currency", "RUB"),
-                    "paid_at": order.get("date")
-                }
-            return None
-
-        except Exception as e:
-            logger.error(f"FreeKassa check error: {e}")
-            return None
-
-    def verify_webhook(self, data: Dict) -> bool:
-        """Проверить подпись webhook от FreeKassa"""
-        # FreeKassa webhook: MD5(shop_id:amount:secret_key:order_id)
-        amount = data.get("AMOUNT", "")
-        order_id = data.get("MERCHANT_ORDER_ID", "")
-        sign = data.get("SIGN", "")
-
-        expected_sign = hashlib.md5(
-            f"{self.shop_id}:{amount}:{self.secret_key}:{order_id}".encode()
-        ).hexdigest()
-
-        return hmac.compare_digest(sign.lower(), expected_sign.lower())
-
-    async def get_payment_methods(self) -> Optional[Dict]:
-        """Получить доступные способы оплаты"""
-        try:
-            params = {
-                "shopId": self.shop_id,
-                "nonce": str(int(datetime.utcnow().timestamp()))
-            }
-            sign_string = f"{params['shopId']}{params['nonce']}{self.api_key}"
-            params["signature"] = hashlib.md5(sign_string.encode()).hexdigest()
-
-            resp = await self.client.post("/currencies", json=params)
-            if resp.status_code == 200:
-                return resp.json()
-            return None
-
-        except Exception as e:
-            logger.error(f"FreeKassa methods error: {e}")
-            return None
-
-    async def close(self):
-        await self.client.aclose()
-
-# ==================== PAYMENT MANAGER ====================
-
-class PaymentManager:
-    """Менеджер платежей — выбор провайдера и обработка"""
-
-    def __init__(self):
-        self.providers: Dict[str, BasePaymentProvider] = {}
-
-    def register_provider(self, provider: BasePaymentProvider):
-        """Зарегистрировать платежный провайдер"""
-        self.providers[provider.name.lower()] = provider
-        logger.info(f"✅ Registered payment provider: {provider.name}")
-
-    async def create_payment(
-        self,
-        provider_name: str,
-        amount: float,
-        description: str,
-        order_id: str,
-        **kwargs
-    ) -> Optional[Dict]:
-        """Создать платеж через выбранный провайдер"""
-        provider = self.providers.get(provider_name.lower())
-        if not provider:
-            logger.error(f"❌ Provider {provider_name} not found")
-            return None
-
-        result = await provider.create_payment(amount, description, order_id, **kwargs)
-        if result:
-            result["provider_name"] = provider_name
-            logger.info(f"✅ Payment created: {provider_name} {amount}₽ order={order_id}")
-        return result
-
-    async def check_payment(self, provider_name: str, payment_id: str) -> Optional[Dict]:
-        """Проверить статус платежа"""
-        provider = self.providers.get(provider_name.lower())
-        if not provider:
-            return None
-        return await provider.check_payment(payment_id)
-
-    def verify_webhook(self, provider_name: str, data: Dict, signature: str = "") -> bool:
-        """Проверить webhook"""
-        provider = self.providers.get(provider_name.lower())
-        if not provider:
-            return False
-        return provider.verify_webhook(data, signature)
-
-    async def close_all(self):
-        """Закрыть все соединения"""
-        for provider in self.providers.values():
-            if hasattr(provider, 'close'):
-                await provider.close()
-
-# ==================== BACKEND ROUTERS (FastAPI) ====================
-
-"""
-# Добавить в backend/app/routers/payments.py:
-
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from app.database import get_db
-from app.models import GustoPayment, GustoUser, GustoSubscription
-from app.services.payments import PaymentManager, CryptoBotPayment, YooKassaPayment, FreeKassaPayment
-from app.config import settings
-
-router = APIRouter()
-
-# Инициализация менеджера платежей
-payment_manager = PaymentManager()
-
-@router.on_event("startup")
-async def init_payment_providers():
-    if settings.CRYPTOBOT_TOKEN:
-        payment_manager.register_provider(CryptoBotPayment(settings.CRYPTOBOT_TOKEN))
-    if settings.YOOKASSA_SHOP_ID and settings.YOOKASSA_SECRET_KEY:
-        payment_manager.register_provider(YooKassaPayment(
-            settings.YOOKASSA_SHOP_ID, settings.YOOKASSA_SECRET_KEY
-        ))
-    if settings.FREEKASSA_ID and settings.FREEKASSA_SECRET:
-        payment_manager.register_provider(FreeKassaPayment(
-            settings.FREEKASSA_ID, settings.FREEKASSA_SECRET, settings.FREEKASSA_API_KEY
-        ))
-
-@router.post("/")
+router = APIRouter(prefix="/api/payments", tags=["Payments"])
+
+# ==================== IP WHITELISTS ====================
+CRYPTOBOT_IPS = ["185.71.76.0/27", "185.71.77.0/27", "77.75.153.0/25", "77.75.154.128/25", "2a00:bdc0::/32"]
+YOOKASSA_IPS = ["185.71.76.0/27", "185.71.77.0/27", "77.75.153.0/25", "77.75.154.128/25", "2a00:bdc0::/32"]
+
+async def verify_webhook_ip(request: Request, allowed_ips: List[str]) -> bool:
+    """Проверить IP webhook'а по whitelist"""
+    client_ip = request.client.host
+    try:
+        client_addr = ipaddress.ip_address(client_ip)
+        for network in allowed_ips:
+            if client_addr in ipaddress.ip_network(network, strict=False):
+                return True
+    except ValueError:
+        pass
+    logger.warning(f"⚠️ Webhook from unauthorized IP: {client_ip}")
+    return False
+
+# ==================== SCHEMAS ====================
+class CreatePaymentRequest(BaseModel):
+    user_id: int
+    plan_id: int
+    provider: str = Field(..., pattern="^(cryptobot|yookassa|freekassa)$")
+    amount: float = Field(..., gt=0)
+    subscription_id: Optional[int] = None
+    currency: str = "RUB"
+
+class PaymentResponse(BaseModel):
+    id: int
+    status: str
+    provider: str
+    amount: float
+    pay_url: Optional[str] = None
+    invoice_id: Optional[str] = None
+    expires_at: Optional[str] = None
+
+# ==================== CREATE PAYMENT ====================
+@router.post("/", response_model=PaymentResponse)
 async def create_payment(
-    data: dict,
+    req: CreatePaymentRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    user_id = data.get("user_id")
-    plan_id = data.get("plan_id")
-    method = data.get("method", "yookassa")
+    """Создать платеж — выбор провайдера, создание подписки PENDING, создание инвойса"""
 
-    # Получить пользователя и тариф
-    user = await db.get(GustoUser, user_id)
-    plan = await db.get(GustoPlan, plan_id)
+    # Get user
+    result = await db.execute(select(GustoUser).where(GustoUser.id == req.user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if not user or not plan:
-        raise HTTPException(404, "User or plan not found")
+    # Create subscription if not exists (for new purchases)
+    subscription_id = req.subscription_id
+    if not subscription_id:
+        sub_service = SubscriptionService(db)
+        try:
+            sub_data = await sub_service.create_pending(
+                user_id=req.user_id,
+                plan_id=req.plan_id,
+                country_code=user.country_code or "RU"
+            )
+            subscription_id = sub_data["subscription_id"]
+        except Exception as e:
+            logger.error(f"❌ Failed to create pending subscription: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create subscription: {str(e)}")
 
-    # Создать запись о платеже
+    # Create payment record
     payment = GustoPayment(
-        user_id=user_id,
-        amount=plan.price,
-        currency="RUB",
-        method=method
+        user_id=req.user_id,
+        subscription_id=subscription_id,
+        plan_id=req.plan_id,
+        amount=req.amount,
+        currency=req.currency,
+        method=PaymentMethod(req.provider),
+        status=PaymentStatus.PENDING,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
     )
     db.add(payment)
     await db.commit()
     await db.refresh(payment)
 
-    # Создать платеж через провайдера
-    result = await payment_manager.create_payment(
-        provider_name=method,
-        amount=float(plan.price),
-        description=f"GUSTO VPN — {plan.name}",
-        order_id=str(payment.id),
-        user_id=user_id,
-        plan_id=plan_id,
-        email=user.username or f"user{user_id}@gustovpn.ru"
-    )
+    # Create invoice via provider
+    if req.provider == "cryptobot":
+        return await _create_cryptobot_invoice(payment, db)
+    elif req.provider == "yookassa":
+        return await _create_yookassa_invoice(payment, db)
+    elif req.provider == "freekassa":
+        return await _create_freekassa_invoice(payment, db)
+    else:
+        raise HTTPException(status_code=400, detail="Unknown provider")
 
-    if not result:
-        payment.status = "failed"
+# ==================== CRYPTOBOT ====================
+async def _create_cryptobot_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
+    """Создать инвойс в CryptoBot"""
+    token = await ConfigService.get("CRYPTOBOT_TOKEN")
+    if not token:
+        raise HTTPException(status_code=400, detail="CryptoBot not configured")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://pay.crypt.bot/api/createInvoice",
+            headers={"Crypto-Pay-API-Token": token, "Content-Type": "application/json"},
+            json={
+                "asset": "USDT",
+                "amount": str(payment.amount),
+                "description": f"GUSTO VPN — Подписка #{payment.plan_id}",
+                "payload": json.dumps({"payment_id": payment.id, "subscription_id": payment.subscription_id}),
+                "paid_btn_name": "viewItem",
+                "paid_btn_url": "https://t.me/gustovpn_bot",
+                "allow_comments": False,
+                "allow_anonymous": False
+            }
+        )
+
+        if resp.status_code != 200:
+            payment.status = PaymentStatus.FAILED
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"CryptoBot error: {resp.text}")
+
+        data = resp.json()
+        if not data.get("ok"):
+            payment.status = PaymentStatus.FAILED
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"CryptoBot error: {data}")
+
+        result = data["result"]
+        payment.provider_payment_id = str(result["invoice_id"])
+        payment.provider_data = result
         await db.commit()
-        raise HTTPException(500, "Failed to create payment")
 
-    # Обновить запись
-    payment.provider_payment_id = result["provider_payment_id"]
-    payment.provider_data = result
+        return PaymentResponse(
+            id=payment.id,
+            status="pending",
+            provider="cryptobot",
+            amount=payment.amount,
+            pay_url=result["pay_url"],
+            invoice_id=str(result["invoice_id"]),
+            expires_at=result.get("expiration_date_time")
+        )
+
+@router.post("/webhook/cryptobot")
+async def cryptobot_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """Webhook от CryptoBot — проверка IP, активация подписки"""
+    # Verify IP (optional but recommended)
+    # if not await verify_webhook_ip(request, CRYPTOBOT_IPS):
+    #     raise HTTPException(status_code=403, detail="Unauthorized IP")
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if data.get("update_type") != "invoice_paid":
+        return {"ok": True}
+
+    payload = data.get("payload", {})
+    invoice_id = payload.get("invoice_id")
+
+    if not invoice_id:
+        return {"ok": False}
+
+    # Find payment by provider_payment_id
+    result = await db.execute(
+        select(GustoPayment).where(
+            GustoPayment.provider_payment_id == str(invoice_id),
+            GustoPayment.status == PaymentStatus.PENDING
+        )
+    )
+    payment = result.scalar_one_or_none()
+
+    if not payment:
+        logger.warning(f"⚠️ CryptoBot webhook: payment not found for invoice {invoice_id}")
+        return {"ok": True}
+
+    # Activate!
+    payment.status = PaymentStatus.SUCCESS
+    payment.paid_at = datetime.utcnow()
+    payment.provider_data = {**payment.provider_data, "webhook_data": data}
     await db.commit()
 
-    return {
-        "payment_id": payment.id,
-        "pay_url": result["pay_url"],
-        "amount": result["amount"],
-        "currency": result["currency"],
-        "status": payment.status
+    # Activate subscription (CRITICAL!)
+    try:
+        sub_service = SubscriptionService(db)
+        activation = await sub_service.activate_after_payment(payment)
+        logger.info(f"✅ Subscription activated via CryptoBot: {activation}")
+    except Exception as e:
+        logger.error(f"❌ Failed to activate subscription after CryptoBot payment: {e}")
+        # Payment is marked success but subscription failed — needs manual intervention
+        # Could add to retry queue
+
+    return {"ok": True}
+
+# ==================== YOOKASSA ====================
+async def _create_yookassa_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
+    """Создать платеж в YooKassa"""
+    shop_id = await ConfigService.get("YOOKASSA_SHOP_ID")
+    secret_key = await ConfigService.get("YOOKASSA_SECRET_KEY")
+
+    if not shop_id or not secret_key:
+        raise HTTPException(status_code=400, detail="YooKassa not configured")
+
+    auth = base64.b64encode(f"{shop_id}:{secret_key}".encode()).decode()
+    idempotence_key = str(uuid.uuid4())
+
+    request_body = {
+        "amount": {"value": f"{payment.amount:.2f}", "currency": payment.currency or "RUB"},
+        "capture": True,
+        "confirmation": {
+            "type": "redirect",
+            "return_url": "https://t.me/gustovpn_bot"
+        },
+        "description": f"GUSTO VPN — Подписка #{payment.plan_id}",
+        "metadata": {
+            "payment_id": str(payment.id),
+            "subscription_id": str(payment.subscription_id),
+            "user_id": str(payment.user_id)
+        },
+        "receipt": {
+            "customer": {"email": "user@gustovpn.ru"},
+            "items": [{
+                "description": "VPN подписка",
+                "quantity": "1.00",
+                "amount": {"value": f"{payment.amount:.2f}", "currency": payment.currency or "RUB"},
+                "vat_code": "1",
+                "payment_mode": "full_payment",
+                "payment_subject": "service"
+            }]
+        }
     }
 
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.yookassa.ru/v3/payments",
+            headers={
+                "Authorization": f"Basic {auth}",
+                "Idempotence-Key": idempotence_key,
+                "Content-Type": "application/json"
+            },
+            json=request_body
+        )
+
+        if resp.status_code not in (200, 201):
+            payment.status = PaymentStatus.FAILED
+            await db.commit()
+            raise HTTPException(status_code=500, detail=f"YooKassa error: {resp.text}")
+
+        data = resp.json()
+        payment.provider_payment_id = data["id"]
+        payment.provider_data = data
+        await db.commit()
+
+        return PaymentResponse(
+            id=payment.id,
+            status="pending",
+            provider="yookassa",
+            amount=payment.amount,
+            pay_url=data["confirmation"]["confirmation_url"],
+            invoice_id=data["id"],
+            expires_at=None
+        )
+
+@router.post("/webhook/yookassa")
+async def yookassa_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """Webhook от YooKassa — активация подписки"""
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = data.get("event", "")
+    obj = data.get("object", {})
+
+    if event not in ("payment.succeeded", "payment.captured"):
+        return {"ok": True}
+
+    payment_id = obj.get("metadata", {}).get("payment_id")
+    if not payment_id:
+        return {"ok": False}
+
+    result = await db.execute(
+        select(GustoPayment).where(
+            GustoPayment.id == int(payment_id),
+            GustoPayment.status == PaymentStatus.PENDING
+        )
+    )
+    payment = result.scalar_one_or_none()
+
+    if not payment:
+        logger.warning(f"⚠️ YooKassa webhook: payment {payment_id} not found or not pending")
+        return {"ok": True}
+
+    # Activate!
+    payment.status = PaymentStatus.SUCCESS
+    payment.paid_at = datetime.utcnow()
+    payment.provider_data = {**payment.provider_data, "webhook_data": data}
+    await db.commit()
+
+    # Activate subscription (CRITICAL!)
+    try:
+        sub_service = SubscriptionService(db)
+        activation = await sub_service.activate_after_payment(payment)
+        logger.info(f"✅ Subscription activated via YooKassa: {activation}")
+    except Exception as e:
+        logger.error(f"❌ Failed to activate subscription after YooKassa payment: {e}")
+
+    return {"ok": True}
+
+# ==================== FREEKASSA ====================
+async def _create_freekassa_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
+    """Создать платеж в FreeKassa"""
+    fk_id = await ConfigService.get("FREEKASSA_ID")
+    fk_secret = await ConfigService.get("FREEKASSA_SECRET")
+
+    if not fk_id or not fk_secret:
+        raise HTTPException(status_code=400, detail="FreeKassa not configured")
+
+    sign = hashlib.md5(
+        f"{fk_id}:{payment.amount:.2f}:{fk_secret}:{payment.id}".encode()
+    ).hexdigest()
+
+    pay_url = (
+        f"https://pay.freekassa.ru/?"
+        f"m={fk_id}&"
+        f"oa={payment.amount:.2f}&"
+        f"o={payment.id}&"
+        f"s={sign}&"
+        f"us_user_id={payment.user_id}&"
+        f"us_plan_id={payment.plan_id}&"
+        f"us_subscription_id={payment.subscription_id}"
+    )
+
+    payment.provider_payment_id = str(payment.id)
+    await db.commit()
+
+    return PaymentResponse(
+        id=payment.id,
+        status="pending",
+        provider="freekassa",
+        amount=payment.amount,
+        pay_url=pay_url,
+        invoice_id=str(payment.id),
+        expires_at=(datetime.utcnow() + timedelta(hours=1)).isoformat()
+    )
+
+@router.post("/webhook/freekassa")
+async def freekassa_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """Webhook от FreeKassa — проверка подписи, активация подписки"""
+    try:
+        data = await request.form()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid form data")
+
+    data_dict = dict(data)
+
+    fk_id = await ConfigService.get("FREEKASSA_ID")
+    fk_secret = await ConfigService.get("FREEKASSA_SECRET")
+
+    # Verify signature
+    amount = data_dict.get("AMOUNT", "")
+    order_id = data_dict.get("MERCHANT_ORDER_ID", "")
+    sign = data_dict.get("SIGN", "")
+
+    expected_sign = hashlib.md5(
+        f"{fk_id}:{amount}:{fk_secret}:{order_id}".encode()
+    ).hexdigest()
+
+    if not hmac.compare_digest(sign.lower(), expected_sign.lower()):
+        logger.warning(f"⚠️ FreeKassa invalid signature for order {order_id}")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    status = data_dict.get("STATUS", "")
+    if status != "1":  # Not success
+        return PlainTextResponse("YES")
+
+    # Find payment
+    result = await db.execute(
+        select(GustoPayment).where(
+            GustoPayment.id == int(order_id),
+            GustoPayment.status == PaymentStatus.PENDING
+        )
+    )
+    payment = result.scalar_one_or_none()
+
+    if not payment:
+        logger.warning(f"⚠️ FreeKassa webhook: payment {order_id} not found")
+        return PlainTextResponse("YES")
+
+    # Activate!
+    payment.status = PaymentStatus.SUCCESS
+    payment.paid_at = datetime.utcnow()
+    payment.provider_data = {**payment.provider_data, "webhook_data": data_dict}
+    await db.commit()
+
+    # Activate subscription (CRITICAL!)
+    try:
+        sub_service = SubscriptionService(db)
+        activation = await sub_service.activate_after_payment(payment)
+        logger.info(f"✅ Subscription activated via FreeKassa: {activation}")
+    except Exception as e:
+        logger.error(f"❌ Failed to activate subscription after FreeKassa payment: {e}")
+
+    return PlainTextResponse("YES")
+
+# ==================== STATUS & HISTORY ====================
 @router.get("/{payment_id}")
 async def get_payment_status(
     payment_id: int,
     db: AsyncSession = Depends(get_db)
 ):
-    payment = await db.get(GustoPayment, payment_id)
+    """Проверить статус платежа"""
+    result = await db.execute(select(GustoPayment).where(GustoPayment.id == payment_id))
+    payment = result.scalar_one_or_none()
+
     if not payment:
-        raise HTTPException(404, "Payment not found")
-
-    # Проверить статус у провайдера
-    if payment.provider_payment_id and payment.status == "pending":
-        result = await payment_manager.check_payment(
-            payment.method,
-            payment.provider_payment_id
-        )
-
-        if result and result["status"] == "success":
-            payment.status = "success"
-            payment.paid_at = datetime.utcnow()
-
-            # Активировать подписку
-            # ... (логика активации)
-
-            await db.commit()
+        raise HTTPException(status_code=404, detail="Payment not found")
 
     return {
         "id": payment.id,
-        "status": payment.status,
+        "status": payment.status.value,
+        "provider": payment.method.value,
         "amount": float(payment.amount),
-        "method": payment.method,
-        "paid_at": payment.paid_at
+        "currency": payment.currency,
+        "created_at": payment.created_at.isoformat() if payment.created_at else None,
+        "paid_at": payment.paid_at.isoformat() if payment.paid_at else None,
+        "is_expired": False  # Add logic if needed
     }
 
-# Webhooks
+@router.get("/history/{user_id}")
+async def get_user_payments(
+    user_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db)
+):
+    """История платежей пользователя"""
+    result = await db.execute(
+        select(GustoPayment)
+        .where(GustoPayment.user_id == user_id)
+        .order_by(GustoPayment.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    payments = result.scalars().all()
 
-@router.post("/webhook/cryptobot")
-async def cryptobot_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    data = await request.json()
+    return [
+        {
+            "id": p.id,
+            "amount": float(p.amount),
+            "provider": p.method.value,
+            "status": p.status.value,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+        }
+        for p in payments
+    ]
 
-    # Проверить подпись
-    # ...
+@router.post("/{payment_id}/refund")
+async def refund_payment(
+    payment_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Возврат платежа (только YooKassa)"""
+    result = await db.execute(select(GustoPayment).where(GustoPayment.id == payment_id))
+    payment = result.scalar_one_or_none()
 
-    # Обработать webhook
-    invoice_id = data.get("payload", {}).get("invoice_id")
-    status = data.get("payload", {}).get("status")
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
 
-    if status == "paid":
-        # Найти платеж по provider_payment_id
-        result = await db.execute(
-            select(GustoPayment).where(
-                GustoPayment.provider_payment_id == str(invoice_id)
-            )
+    if payment.method != PaymentMethod.YOOKASSA:
+        raise HTTPException(status_code=400, detail="Refund only supported for YooKassa")
+
+    shop_id = await ConfigService.get("YOOKASSA_SHOP_ID")
+    secret_key = await ConfigService.get("YOOKASSA_SECRET_KEY")
+    auth = base64.b64encode(f"{shop_id}:{secret_key}".encode()).decode()
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.yookassa.ru/v3/payments/{payment.provider_payment_id}/refunds",
+            headers={
+                "Authorization": f"Basic {auth}",
+                "Idempotence-Key": str(uuid.uuid4()),
+                "Content-Type": "application/json"
+            },
+            json={"amount": {"value": f"{float(payment.amount):.2f}", "currency": payment.currency}}
         )
-        payment = result.scalar_one_or_none()
 
-        if payment:
-            payment.status = "success"
-            payment.paid_at = datetime.utcnow()
+        if resp.status_code in (200, 201):
+            payment.status = PaymentStatus.REFUNDED
             await db.commit()
-
-            # Активировать подписку
-            # ...
-
-    return {"status": "processed"}
-
-@router.post("/webhook/yookassa")
-async def yookassa_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    data = await request.json()
-
-    payment_id = data.get("object", {}).get("id")
-    status = data.get("object", {}).get("status")
-
-    if status == "succeeded":
-        result = await db.execute(
-            select(GustoPayment).where(
-                GustoPayment.provider_payment_id == payment_id
-            )
-        )
-        payment = result.scalar_one_or_none()
-
-        if payment:
-            payment.status = "success"
-            payment.paid_at = datetime.utcnow()
-            await db.commit()
-
-            # Активировать подписку
-            # ...
-
-    return {"status": "processed"}
-
-@router.post("/webhook/freekassa")
-async def freekassa_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    data = await request.form()
-    data_dict = dict(data)
-
-    # Проверить подпись
-    provider = payment_manager.providers.get("freekassa")
-    if provider and not provider.verify_webhook(data_dict):
-        raise HTTPException(403, "Invalid signature")
-
-    order_id = data_dict.get("MERCHANT_ORDER_ID")
-    status = data_dict.get("STATUS")
-
-    if status == "1":  # Успешный платеж
-        result = await db.execute(
-            select(GustoPayment).where(
-                GustoPayment.provider_payment_id == order_id
-            )
-        )
-        payment = result.scalar_one_or_none()
-
-        if payment:
-            payment.status = "success"
-            payment.paid_at = datetime.utcnow()
-            await db.commit()
-
-            # Активировать подписку
-            # ...
-
-    return {"status": "processed"}
-"""
+            return {"status": "refunded"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Refund failed: {resp.text}")

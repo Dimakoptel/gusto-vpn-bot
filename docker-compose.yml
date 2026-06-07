@@ -1,0 +1,165 @@
+version: "3.8"
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: gusto-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-gusto}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-gusto_secret_2024}
+      POSTGRES_DB: ${DB_NAME:-gusto_vpn}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/backups:/backups
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-gusto} -d ${DB_NAME:-gusto_vpn}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gusto-network
+
+  # Redis Cache & FSM Storage
+  redis:
+    image: redis:7-alpine
+    container_name: gusto-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gusto-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gusto-backend
+    restart: unless-stopped
+    environment:
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-gusto}:${DB_PASSWORD:-gusto_secret_2024}@postgres:5432/${DB_NAME:-gusto_vpn}
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Bot (initial token — will be overridden via admin panel)
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      # Secrets
+      SECRET_KEY: ${SECRET_KEY:-gusto_super_secret_key_change_in_production}
+      # Environment
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - gusto-network
+
+  # Telegram Bot
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: gusto-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      BACKEND_URL: http://backend:8000
+      REDIS_URL: redis://redis:6379/1
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gusto-network
+
+  # Admin Panel (React)
+  admin-panel:
+    build:
+      context: ./admin-panel
+      dockerfile: Dockerfile
+    container_name: gusto-admin
+    restart: unless-stopped
+    environment:
+      REACT_APP_API_URL: http://backend:8000
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - gusto-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: gusto-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - admin-panel
+    networks:
+      - gusto-network
+
+  # Backup Service (runs daily)
+  backup:
+    image: postgres:16-alpine
+    container_name: gusto-backup
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-gusto}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-gusto_secret_2024}
+      POSTGRES_DB: ${DB_NAME:-gusto_vpn}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - postgres_data:/backup/source:ro
+      - ./backups:/backups
+    command: >
+      sh -c "
+        while true; do
+          sleep 86400;
+          PGPASSWORD=$$POSTGRES_PASSWORD pg_dump -h postgres -U $$POSTGRES_USER $$POSTGRES_DB | gzip > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql.gz;
+          find /backups -name 'backup_*.sql.gz' -mtime +$$BACKUP_RETENTION_DAYS -delete;
+        done
+      "
+    depends_on:
+      - postgres
+    networks:
+      - gusto-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  gusto-network:
+    driver: bridge

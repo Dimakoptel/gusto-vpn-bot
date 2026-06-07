@@ -1,225 +1,287 @@
-"""Admin Settings API — управление всеми настройками через веб-панель"""
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Body
+"""
+Settings Router
+CRUD для SystemSettings + endpoints для админ-панели
+"""
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
-from app.models.app_config import AppConfig
-from app.services.config_service import ConfigService
+from backend.app.database import get_db
+from backend.app.models.settings import SystemSettings
+from backend.app.services.config_service import ConfigService
+from backend.app.dependencies import get_current_admin
 
-router = APIRouter(prefix="/api/settings", tags=["Settings"])
+router = APIRouter(prefix="/settings", tags=["Settings"])
 
+# === Pydantic Schemas ===
 
-class ConfigItemResponse(BaseModel):
-    key: str
-    value: Any
-    value_type: str
-    description: str
-    category: str
-    is_sensitive: bool
-    is_editable: bool
-    updated_at: Optional[str] = None
+class BotSettingsSchema(BaseModel):
+    bot_token: Optional[str] = None
+    admin_ids: Optional[List[int]] = None
+    support_username: Optional[str] = None
+    welcome_message: Optional[str] = None
+
+class PaymentSettingsSchema(BaseModel):
+    cryptobot_token: Optional[str] = None
+    cryptobot_enabled: Optional[bool] = None
+    yookassa_shop_id: Optional[str] = None
+    yookassa_secret_key: Optional[str] = None
+    yookassa_enabled: Optional[bool] = None
+    yookassa_fiscal_enabled: Optional[bool] = None
+    freekassa_id: Optional[str] = None
+    freekassa_secret: Optional[str] = None
+    freekassa_api_key: Optional[str] = None
+    freekassa_enabled: Optional[bool] = None
+
+class ReferralSettingsSchema(BaseModel):
+    referral_enabled: Optional[bool] = None
+    referral_level1_percent: Optional[float] = Field(None, ge=0, le=100)
+    referral_level2_percent: Optional[float] = Field(None, ge=0, le=100)
+    referral_level3_percent: Optional[float] = Field(None, ge=0, le=100)
+    referral_min_payout: Optional[float] = Field(None, ge=0)
+
+class AntifraudSettingsSchema(BaseModel):
+    antifraud_enabled: Optional[bool] = None
+    antifraud_max_ips: Optional[int] = Field(None, ge=1, le=20)
+    antifraud_max_countries: Optional[int] = Field(None, ge=1, le=10)
+    antifraud_ban_hours: Optional[int] = Field(None, ge=1, le=720)
+
+class NotificationSettingsSchema(BaseModel):
+    notify_expiry_3days: Optional[bool] = None
+    notify_expiry_1day: Optional[bool] = None
+    notify_expiry_today: Optional[bool] = None
+    notify_low_traffic_gb: Optional[float] = Field(None, ge=0.1, le=1000)
+    notify_channel_id: Optional[str] = None
+
+class SystemSettingsSchema(BaseModel):
+    app_name: Optional[str] = None
+    app_logo_url: Optional[str] = None
+    maintenance_mode: Optional[bool] = None
+
+class FullSettingsUpdateSchema(BaseModel):
+    bot: Optional[BotSettingsSchema] = None
+    payments: Optional[PaymentSettingsSchema] = None
+    referral: Optional[ReferralSettingsSchema] = None
+    antifraud: Optional[AntifraudSettingsSchema] = None
+    notifications: Optional[NotificationSettingsSchema] = None
+    system: Optional[SystemSettingsSchema] = None
+
+class SettingsResponse(BaseModel):
+    id: int
+    bot_token: Optional[str]
+    admin_ids: List[int]
+    support_username: Optional[str]
+    welcome_message: Optional[str]
+    cryptobot_enabled: bool
+    yookassa_enabled: bool
+    freekassa_enabled: bool
+    referral_enabled: bool
+    referral_level1_percent: float
+    referral_level2_percent: float
+    referral_level3_percent: float
+    referral_min_payout: float
+    antifraud_enabled: bool
+    antifraud_max_ips: int
+    antifraud_max_countries: int
+    antifraud_ban_hours: int
+    notify_expiry_3days: bool
+    notify_expiry_1day: bool
+    notify_expiry_today: bool
+    notify_low_traffic_gb: float
+    notify_channel_id: Optional[str]
+    app_name: str
+    app_logo_url: Optional[str]
+    maintenance_mode: bool
+    created_at: Optional[str]
+    updated_at: Optional[str]
 
     class Config:
         from_attributes = True
 
+# === Endpoints ===
 
-class ConfigUpdateRequest(BaseModel):
-    key: str
-    value: Any
+@router.get("/", response_model=SettingsResponse)
+async def get_settings(
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Получить все настройки системы"""
+    service = ConfigService(db)
+    settings = service.get_settings()
+    return settings
 
+@router.put("/", response_model=SettingsResponse)
+async def update_settings(
+    data: FullSettingsUpdateSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки (любую группу или все сразу)"""
+    service = ConfigService(db)
 
-class BulkConfigUpdateRequest(BaseModel):
-    settings: Dict[str, Any] = Field(..., description="Ключ-значение для массового обновления")
+    update_data = {}
+    if data.bot:
+        update_data.update(data.bot.model_dump(exclude_unset=True))
+    if data.payments:
+        update_data.update(data.payments.model_dump(exclude_unset=True))
+    if data.referral:
+        update_data.update(data.referral.model_dump(exclude_unset=True))
+    if data.antifraud:
+        update_data.update(data.antifraud.model_dump(exclude_unset=True))
+    if data.notifications:
+        update_data.update(data.notifications.model_dump(exclude_unset=True))
+    if data.system:
+        update_data.update(data.system.model_dump(exclude_unset=True))
 
+    settings = service.update_settings(update_data, admin_id=admin.id)
+    return settings
 
-class CategoryResponse(BaseModel):
-    category: str
-    label: str
-    icon: str
-    description: str
+@router.patch("/bot", response_model=SettingsResponse)
+async def update_bot_settings(
+    data: BotSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки бота"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
 
+@router.patch("/payments", response_model=SettingsResponse)
+async def update_payment_settings(
+    data: PaymentSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки платежей"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
 
-CATEGORIES = [
-    CategoryResponse(category="brand", label="Бренд", icon="Palette", description="Название, слоган, поддержка"),
-    CategoryResponse(category="telegram", label="Telegram", icon="MessageCircle", description="Бот, токены, админы"),
-    CategoryResponse(category="payments", label="Платежи", icon="CreditCard", description="Провайдеры, токены, валюта"),
-    CategoryResponse(category="referral", label="Реферальная система", icon="Users", description="Проценты, минимумы"),
-    CategoryResponse(category="security", label="Безопасность", icon="Shield", description="Антифрод, лимиты"),
-    CategoryResponse(category="router", label="Smart Router", icon="Route", description="Веса, latency, fallback"),
-    CategoryResponse(category="notifications", label="Уведомления", icon="Bell", description="Уведомления пользователям"),
-    CategoryResponse(category="backup", label="Бэкапы", icon="Database", description="S3, расписание, хранение"),
-    CategoryResponse(category="monitor", label="Мониторинг", icon="Activity", description="3x-ui, интервалы"),
-]
+@router.patch("/referral", response_model=SettingsResponse)
+async def update_referral_settings(
+    data: ReferralSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки реферальной системы"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
 
+@router.patch("/antifraud", response_model=SettingsResponse)
+async def update_antifraud_settings(
+    data: AntifraudSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки антифрода"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
 
-def _mask_sensitive(config: AppConfig) -> AppConfig:
-    """Маскируем чувствительные значения для ответа"""
-    if config.is_sensitive and config.value:
-        config.value = "•" * min(len(config.value), 20)
+@router.patch("/notifications", response_model=SettingsResponse)
+async def update_notification_settings(
+    data: NotificationSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить настройки уведомлений"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
+
+@router.patch("/system", response_model=SettingsResponse)
+async def update_system_settings(
+    data: SystemSettingsSchema,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Обновить системные настройки"""
+    service = ConfigService(db)
+    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    return settings
+
+@router.get("/payments/{provider}/config")
+async def get_payment_provider_config(
+    provider: str,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
+):
+    """Получить конфигурацию конкретного платежного провайдера"""
+    service = ConfigService(db)
+    config = service.get_payment_config(provider)
+    if not config:
+        raise HTTPException(status_code=404, detail="Provider not found")
     return config
 
-
-@router.get("/categories", response_model=List[CategoryResponse])
-async def get_categories():
-    """Получить список категорий настроек"""
-    return CATEGORIES
-
-
-@router.get("/", response_model=List[ConfigItemResponse])
-async def get_all_settings(
-    category: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+@router.post("/payments/{provider}/test")
+async def test_payment_provider(
+    provider: str,
+    db: Session = Depends(get_db),
+    admin = Depends(get_current_admin)
 ):
-    """Получить все настройки (опционально по категории)"""
-    if category:
-        configs = await ConfigService.get_by_category(category, db)
-    else:
-        configs = await ConfigService.get_all(db)
+    """Тестовый запрос к платежному провайдеру (проверка токена)"""
+    service = ConfigService(db)
+    config = service.get_payment_config(provider)
 
-    # Initialize defaults if empty
-    if not configs:
-        await ConfigService.initialize_defaults(db)
-        configs = await ConfigService.get_all(db)
+    if not config.get("enabled"):
+        return {"status": "disabled", "message": "Провайдер отключен"}
 
-    result = []
-    for config in configs:
-        masked = _mask_sensitive(config)
-        result.append(ConfigItemResponse(
-            key=masked.key,
-            value=ConfigService._parse_value(masked.value, masked.value_type),
-            value_type=masked.value_type,
-            description=masked.description,
-            category=masked.category,
-            is_sensitive=masked.is_sensitive,
-            is_editable=masked.is_editable,
-            updated_at=masked.updated_at.isoformat() if masked.updated_at else None,
-        ))
-    return result
+    # Тестовая логика для каждого провайдера
+    if provider == "cryptobot":
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://pay.crypt.bot/api/getMe",
+                    headers={"Crypto-Pay-API-Token": config.get("token", "")}
+                )
+                if resp.status_code == 200:
+                    return {"status": "ok", "message": "Токен валиден", "data": resp.json()}
+                else:
+                    return {"status": "error", "message": "Неверный токен", "code": resp.status_code}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
+    elif provider == "yookassa":
+        import httpx
+        import base64
+        try:
+            auth = base64.b64encode(f"{config.get('shop_id')}:{config.get('secret_key')}".encode()).decode()
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.yookassa.ru/v3/me",
+                    headers={"Authorization": f"Basic {auth}"}
+                )
+                if resp.status_code == 200:
+                    return {"status": "ok", "message": "Ключи валидны", "data": resp.json()}
+                else:
+                    return {"status": "error", "message": "Неверные ключи", "code": resp.status_code}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
-@router.get("/{key}", response_model=ConfigItemResponse)
-async def get_setting(key: str, db: AsyncSession = Depends(get_db)):
-    """Получить одну настройку по ключу"""
-    from sqlalchemy import select
-    result = await db.execute(select(AppConfig).where(AppConfig.key == key))
-    config = result.scalar_one_or_none()
+    elif provider == "freekassa":
+        return {"status": "manual", "message": "Проверьте вручную на сайте FreeKassa"}
 
-    if not config:
-        if key in ConfigService.DEFAULTS:
-            meta = ConfigService.DEFAULTS[key]
-            return ConfigItemResponse(
-                key=key,
-                value=ConfigService._parse_value(meta["value"], meta.get("type", "str")),
-                value_type=meta.get("type", "str"),
-                description=meta.get("description", ""),
-                category=meta.get("category", "general"),
-                is_sensitive=meta.get("is_sensitive", False),
-                is_editable=meta.get("is_editable", True),
-            )
-        raise HTTPException(status_code=404, detail=f"Setting {key} not found")
+    return {"status": "unknown", "message": "Неизвестный провайдер"}
 
-    masked = _mask_sensitive(config)
-    return ConfigItemResponse(
-        key=masked.key,
-        value=ConfigService._parse_value(masked.value, masked.value_type),
-        value_type=masked.value_type,
-        description=masked.description,
-        category=masked.category,
-        is_sensitive=masked.is_sensitive,
-        is_editable=masked.is_editable,
-        updated_at=masked.updated_at.isoformat() if masked.updated_at else None,
-    )
-
-
-@router.put("/{key}", response_model=ConfigItemResponse)
-async def update_setting(
-    key: str,
-    value: Any = Body(..., embed=True),
-    db: AsyncSession = Depends(get_db)
+@router.get("/health")
+async def settings_health_check(
+    db: Session = Depends(get_db)
 ):
-    """Обновить одну настройку"""
-    try:
-        config = await ConfigService.set(key, value, db)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Проверка здоровья системы (публичный endpoint)"""
+    service = ConfigService(db)
+    s = service.get_settings()
 
-    return ConfigItemResponse(
-        key=config.key,
-        value=ConfigService._parse_value(config.value, config.value_type),
-        value_type=config.value_type,
-        description=config.description,
-        category=config.category,
-        is_sensitive=config.is_sensitive,
-        is_editable=config.is_editable,
-        updated_at=config.updated_at.isoformat() if config.updated_at else None,
-    )
-
-
-@router.put("/", response_model=List[ConfigItemResponse])
-async def bulk_update_settings(
-    request: BulkConfigUpdateRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Массовое обновление настроек"""
-    configs = await ConfigService.set_many(request.settings, db)
-
-    result = []
-    for config in configs:
-        result.append(ConfigItemResponse(
-            key=config.key,
-            value=ConfigService._parse_value(config.value, config.value_type),
-            value_type=config.value_type,
-            description=config.description,
-            category=config.category,
-            is_sensitive=config.is_sensitive,
-            is_editable=config.is_editable,
-            updated_at=config.updated_at.isoformat() if config.updated_at else None,
-        ))
-    return result
-
-
-@router.post("/{key}/reset")
-async def reset_setting(key: str, db: AsyncSession = Depends(get_db)):
-    """Сбросить настройку к дефолтному значению"""
-    try:
-        config = await ConfigService.reset_to_default(key, db)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return {"status": "reset", "key": config.key, "value": ConfigService._parse_value(config.value, config.value_type)}
-
-
-@router.post("/initialize")
-async def initialize_defaults(db: AsyncSession = Depends(get_db)):
-    """Инициализация дефолтных настроек (используется при первом запуске)"""
-    await ConfigService.initialize_defaults(db)
-    return {"status": "initialized", "count": len(ConfigService.DEFAULTS)}
-
-
-@router.get("/export/json")
-async def export_settings(
-    include_sensitive: bool = False,
-    db: AsyncSession = Depends(get_db)
-):
-    """Экспорт всех настроек в JSON"""
-    data = await ConfigService.export_config(db, include_sensitive=include_sensitive)
     return {
-        "exported_at": datetime.utcnow().isoformat(),
-        "settings": data,
+        "maintenance_mode": s.maintenance_mode,
+        "payments_available": {
+            "cryptobot": s.cryptobot_enabled and bool(s.cryptobot_token),
+            "yookassa": s.yookassa_enabled and bool(s.yookassa_shop_id) and bool(s.yookassa_secret_key),
+            "freekassa": s.freekassa_enabled and bool(s.freekassa_id) and bool(s.freekassa_secret),
+        },
+        "referral_enabled": s.referral_enabled,
+        "antifraud_enabled": s.antifraud_enabled,
     }
-
-
-@router.post("/import/json")
-async def import_settings(
-    data: Dict[str, Any] = Body(...),
-    db: AsyncSession = Depends(get_db)
-):
-    """Импорт настроек из JSON"""
-    settings_data = data.get("settings", data)
-    await ConfigService.import_config(settings_data, db)
-    return {"status": "imported", "count": len(settings_data)}
-
-
-from datetime import datetime
