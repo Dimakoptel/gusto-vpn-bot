@@ -1,370 +1,253 @@
-"""
-GUSTO Notification Service — отправка уведомлений в Telegram
-"""
-import logging
+"""Notification Service — использует динамические настройки из БД"""
+import asyncio
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime
+
 from aiogram import Bot
-from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-logger = logging.getLogger("gusto.notifications")
+from app.services.config_service import get_config, get_configs
+
 
 class NotificationService:
-    """Сервис уведомлений для пользователей бота"""
+    """Отправка уведомлений в Telegram с динамическими настройками"""
 
     def __init__(self, bot: Bot):
         self.bot = bot
 
-    async def send_notification(self, telegram_id: int, text: str, 
-                                 reply_markup: Optional[InlineKeyboardMarkup] = None):
-        """Отправить уведомление пользователю"""
-        try:
-            await self.bot.send_message(
-                chat_id=telegram_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
-            )
-            logger.info(f"✅ Notification sent to {telegram_id}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to send notification to {telegram_id}: {e}")
-            return False
+    async def _get_support_username(self) -> str:
+        return await get_config("SUPPORT_USERNAME", "gusto_support")
 
-    # ==================== PAYMENT NOTIFICATIONS ====================
+    async def _get_support_link(self) -> str:
+        link = await get_config("SUPPORT_LINK", "")
+        if link:
+            return link
+        username = await self._get_support_username()
+        return f"https://t.me/{username}" if username else ""
 
-    async def payment_success(self, telegram_id: int, plan_name: str, 
-                               amount: float, config_link: str):
-        """Уведомление об успешной оплате + конфигурация"""
-        text = (
-            f"🎉 <b>Оплата успешна!</b>
+    async def _get_brand_name(self) -> str:
+        return await get_config("BRAND_NAME", "GUSTO VPN")
 
-"
-            f"✅ Подписка <b>{plan_name}</b> активирована
-"
-            f"💰 Сумма: <b>{amount:.0f}₽</b>
+    async def _should_notify(self, key: str) -> bool:
+        return await get_config(key, True)
 
-"
-            f"🔑 <b>Ваша конфигурация:</b>
-"
-            f"<code>{config_link}</code>
-
-"
-            f"📱 <b>Как подключить:</b>
-"
-            f"1. Android: V2RayNG или NekoBox
-"
-            f"2. iOS: Streisand или Shadowrocket
-"
-            f"3. Windows: NekoRay или v2rayN
-"
-            f"4. macOS: V2RayXS или V2RayU
-
-"
-            f"Вставьте ссылку в приложение и подключайтесь! 🚀"
-        )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Копировать конфиг", callback_data="copy_config")],
-            [InlineKeyboardButton(text="📊 Мой кабинет", callback_data="account")]
+    def _support_keyboard(self, support_link: str) -> Optional[InlineKeyboardMarkup]:
+        if not support_link:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Поддержка", url=support_link)]
         ])
 
-        await self.send_notification(telegram_id, text, kb)
+    # ========== USER NOTIFICATIONS ==========
 
-    async def payment_failed(self, telegram_id: int, amount: float, 
-                              reason: str = "Ошибка платежа"):
-        """Уведомление о неудачной оплате"""
+    async def payment_success(self, user_id: int, amount: float, currency: str, subscription_info: str):
+        if not await self._should_notify("NOTIFY_PAYMENT_SUCCESS"):
+            return
+
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
+
         text = (
-            f"❌ <b>Оплата не прошла</b>
-
-"
-            f"Сумма: <b>{amount:.0f}₽</b>
-"
-            f"Причина: {reason}
-
-"
-            f"Попробуйте снова или обратитесь в поддержку."
+            f"✅ <b>Оплата прошла успешно!</b>\n\n"
+            f"💰 Сумма: <code>{amount} {currency}</code>\n"
+            f"📦 Подписка: {subscription_info}\n\n"
+            f"Спасибо за доверие к {brand}! 🚀"
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="buy")],
-            [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")]
+        await self.bot.send_message(
+            user_id, text,
+            parse_mode="HTML",
+            reply_markup=self._support_keyboard(support_link)
+        )
+
+    async def payment_failed(self, user_id: int, amount: float, reason: str):
+        if not await self._should_notify("NOTIFY_PAYMENT_FAILED"):
+            return
+
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
+
+        text = (
+            f"❌ <b>Оплата не удалась</b>\n\n"
+            f"💰 Сумма: <code>{amount}</code>\n"
+            f"Причина: {reason}\n\n"
+            f"Попробуйте ещё раз или обратитесь в поддержку {brand}."
+        )
+
+        await self.bot.send_message(
+            user_id, text,
+            parse_mode="HTML",
+            reply_markup=self._support_keyboard(support_link)
+        )
+
+    async def subscription_expiring_soon(self, user_id: int, days_left: int, sub_info: str):
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
+
+        text = (
+            f"⏰ <b>Подписка истекает через {days_left} {self._plural_days(days_left)}!</b>\n\n"
+            f"📦 {sub_info}\n\n"
+            f"Не забудьте продлить, чтобы оставаться на связи с {brand}. 🌐"
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Продлить", callback_data="renew_subscription")],
+            [InlineKeyboardButton(text="🆘 Поддержка", url=support_link)] if support_link else []
         ])
 
-        await self.send_notification(telegram_id, text, kb)
+        await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=keyboard)
 
-    async def payment_pending(self, telegram_id: int, amount: float, 
-                               pay_url: str, timeout_minutes: int = 30):
-        """Уведомление об ожидании оплаты"""
+    async def subscription_expired(self, user_id: int, sub_info: str):
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
+
         text = (
-            f"⏳ <b>Ожидание оплаты</b>
-
-"
-            f"Сумма: <b>{amount:.0f}₽</b>
-"
-            f"У вас есть <b>{timeout_minutes} минут</b> для оплаты.
-
-"
-            f"После оплаты конфигурация придет автоматически."
+            f"🔴 <b>Подписка истекла</b>\n\n"
+            f"📦 {sub_info}\n\n"
+            f"Ваш доступ к {brand} приостановлен. Продлите подписку, чтобы возобновить доступ."
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="check_payment")]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Продлить", callback_data="buy_subscription")],
+            [InlineKeyboardButton(text="🆘 Поддержка", url=support_link)] if support_link else []
         ])
 
-        await self.send_notification(telegram_id, text, kb)
+        await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=keyboard)
 
-    # ==================== SUBSCRIPTION NOTIFICATIONS ====================
+    async def low_traffic(self, user_id: int, remaining_gb: float, total_gb: float):
+        threshold = await get_config("LOW_TRAFFIC_THRESHOLD_GB", 5.0)
+        if remaining_gb > threshold:
+            return
 
-    async def subscription_expiring_soon(self, telegram_id: int, days_left: int,
-                                        plan_name: str, expiry_date: str):
-        """Уведомление об истечении подписки (за 3/1 день)"""
-        emoji = "⚠️" if days_left == 3 else "🚨"
-        urgency = "скоро" if days_left == 3 else "<b>ЗАВТРА</b>"
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
 
         text = (
-            f"{emoji} <b>Подписка истекает {urgency}!</b>
-
-"
-            f"📋 Тариф: <b>{plan_name}</b>
-"
-            f"📅 До: <b>{expiry_date}</b>
-"
-            f"⏳ Осталось: <b>{days_left} {'дня' if days_left == 3 else 'день'}</b>
-
-"
-            f"Продлите сейчас, чтобы не потерять доступ!"
+            f"⚠️ <b>Заканчивается трафик</b>\n\n"
+            f"📊 Осталось: <code>{remaining_gb:.1f} GB</code> из {total_gb} GB\n\n"
+            f"Рекомендуем продлить или обновить тариф {brand}."
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Продлить", callback_data="renew")],
-            [InlineKeyboardButton(text="📊 Мой кабинет", callback_data="account")]
-        ])
+        await self.bot.send_message(
+            user_id, text,
+            parse_mode="HTML",
+            reply_markup=self._support_keyboard(support_link)
+        )
 
-        await self.send_notification(telegram_id, text, kb)
+    async def config_sharing_detected(self, user_id: int, ip_count: int, action: str):
+        brand = await self._get_brand_name()
 
-    async def subscription_expired(self, telegram_id: int, plan_name: str):
-        """Уведомление об истечении подписки"""
         text = (
-            f"🔴 <b>Подписка истекла</b>
-
-"
-            f"📋 Тариф: <b>{plan_name}</b>
-
-"
-            f"Ваш доступ к VPN приостановлен.
-"
-            f"Продлите подписку, чтобы возобновить доступ."
+            f"🚨 <b>Обнаружено подозрительная активность</b>\n\n"
+            f"Ваш конфиг используется с {ip_count} разных IP-адресов.\n"
+            f"Действие: <b>{action}</b>\n\n"
+            f"Если это не вы — срочно обратитесь в поддержку {brand}."
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Продлить", callback_data="renew")],
-            [InlineKeyboardButton(text="🛒 Новая подписка", callback_data="buy")]
-        ])
+        await self.bot.send_message(user_id, text, parse_mode="HTML")
 
-        await self.send_notification(telegram_id, text, kb)
+    async def referral_reward(self, user_id: int, level: int, amount: float, from_user: str):
+        brand = await self._get_brand_name()
 
-    async def low_traffic(self, telegram_id: int, remaining_gb: float, 
-                         total_gb: float, plan_name: str):
-        """Уведомление о заканчивающемся трафике"""
         text = (
-            f"📉 <b>Трафик заканчивается!</b>
-
-"
-            f"📋 Тариф: <b>{plan_name}</b>
-"
-            f"📊 Осталось: <b>{remaining_gb:.1f} GB</b> из {total_gb} GB
-
-"
-            f"Пополните трафик или продлите подписку."
+            f"🎉 <b>Реферальное вознаграждение!</b>\n\n"
+            f"Уровень {level}: +<code>{amount}</code> руб.\n"
+            f"От пользователя: {from_user}\n\n"
+            f"Продолжайте приглашать друзей в {brand}! 💪"
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Продлить", callback_data="renew")],
-            [InlineKeyboardButton(text="📊 Мой кабинет", callback_data="account")]
-        ])
+        await self.bot.send_message(user_id, text, parse_mode="HTML")
 
-        await self.send_notification(telegram_id, text, kb)
+    async def welcome_message(self, user_id: int, referral_code: Optional[str] = None):
+        welcome = await get_config("WELCOME_MESSAGE", "Добро пожаловать в GUSTO VPN! 🚀")
+        brand = await self._get_brand_name()
+        support_link = await self._get_support_link()
 
-    async def subscription_activated(self, telegram_id: int, plan_name: str,
-                                      expiry_date: str, server_name: str):
-        """Уведомление об активации подписки"""
+        text = f"{welcome}\n\n"
+        if referral_code:
+            text += f"Ваш реферальный код: <code>{referral_code}</code>\n\n"
+        text += f"Используйте меню ниже для управления подпиской {brand}."
+
+        await self.bot.send_message(
+            user_id, text,
+            parse_mode="HTML",
+            reply_markup=self._support_keyboard(support_link)
+        )
+
+    # ========== ADMIN NOTIFICATIONS ==========
+
+    async def admin_new_payment(self, admin_ids: List[int], user_id: int, amount: float, provider: str):
+        brand = await self._get_brand_name()
+
         text = (
-            f"✅ <b>Подписка активирована!</b>
-
-"
-            f"📋 Тариф: <b>{plan_name}</b>
-"
-            f"📡 Сервер: <b>{server_name}</b>
-"
-            f"📅 Действует до: <b>{expiry_date}</b>
-
-"
-            f"Получите конфигурацию в личном кабинете."
+            f"💰 <b>Новая оплата в {brand}</b>\n\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Сумма: <code>{amount}</code>\n"
+            f"Провайдер: {provider}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 Получить конфиг", callback_data="config")],
-            [InlineKeyboardButton(text="📊 Мой кабинет", callback_data="account")]
-        ])
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text, parse_mode="HTML")
+            except Exception:
+                pass
 
-        await self.send_notification(telegram_id, text, kb)
+    async def admin_server_offline(self, admin_ids: List[int], server_name: str, reason: str):
+        if not await self._should_notify("NOTIFY_SERVER_OFFLINE"):
+            return
 
-    # ==================== REFERRAL NOTIFICATIONS ====================
+        brand = await self._get_brand_name()
 
-    async def referral_earned(self, telegram_id: int, amount: float, 
-                             level: int, referrer_name: str):
-        """Уведомление о реферальном начислении"""
         text = (
-            f"💰 <b>Реферальное начисление!</b>
-
-"
-            f"👤 {referrer_name} оплатил подписку
-"
-            f"🏆 Уровень: <b>{level}</b>
-"
-            f"💵 Начислено: <b>{amount:.2f}₽</b>
-
-"
-            f"Продолжайте приглашать друзей!"
+            f"🔴 <b>Сервер недоступен — {brand}</b>\n\n"
+            f"🖥 {server_name}\n"
+            f"Причина: {reason}\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Требуется проверка!"
         )
 
-        await self.send_notification(telegram_id, text)
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text, parse_mode="HTML")
+            except Exception:
+                pass
 
-    async def achievement_unlocked(self, telegram_id: int, achievement_name: str,
-                                    reward: float = 0):
-        """Уведомление о разблокированном достижении"""
+    async def admin_3xui_update(self, admin_ids: List[int], version: str, changes: str):
         text = (
-            f"🏆 <b>Новое достижение!</b>
-
-"
-            f"🎉 <b>{achievement_name}</b>
-"
-        )
-        if reward > 0:
-            text += f"💰 Награда: <b>{reward:.0f}₽</b>
-
-"
-        text += "Продолжайте в том же духе!"
-
-        await self.send_notification(telegram_id, text)
-
-    # ==================== SECURITY NOTIFICATIONS ====================
-
-    async def config_sharing_detected(self, telegram_id: int, unique_ips: int,
-                                       action: str = "rotate"):
-        """Уведомление об обнаружении sharing"""
-        text = (
-            f"🛡️ <b>GUSTO Shield: Обнаружена подозрительная активность</b>
-
-"
-            f"🔍 Обнаружено <b>{unique_ips}</b> уникальных IP
-"
-            f"⚠️ Возможно, конфигурация используется на нескольких устройствах
-
-"
+            f"📦 <b>Доступно обновление 3x-ui</b>\n\n"
+            f"Версия: <code>{version}</code>\n"
+            f"Изменения:\n{changes}\n\n"
+            f"Рекомендуется проверить совместимость API перед обновлением."
         )
 
-        if action == "rotate":
-            text += "🔑 Ваша конфигурация будет обновлена автоматически."
-        elif action == "ban":
-            text += "🔴 Подписка приостановлена. Обратитесь в поддержку."
+        for admin_id in admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text, parse_mode="HTML")
+            except Exception:
+                pass
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")]
-        ])
-
-        await self.send_notification(telegram_id, text, kb)
-
-    async def ip_changed(self, telegram_id: int, old_ip: str, new_ip: str):
-        """Уведомление о смене IP (опционально)"""
-        text = (
-            f"📍 <b>Обнаружена смена IP</b>
-
-"
-            f"Старый: <code>{old_ip}</code>
-"
-            f"Новый: <code>{new_ip}</code>
-
-"
-            f"Если это не вы — обратитесь в поддержку."
-        )
-
-        await self.send_notification(telegram_id, text)
-
-    # ==================== ADMIN NOTIFICATIONS ====================
-
-    async def admin_new_payment(self, admin_id: int, user_id: int, 
-                                 amount: float, plan_name: str):
-        """Уведомление админу о новом платеже"""
-        text = (
-            f"💰 <b>Новый платеж!</b>
-
-"
-            f"👤 User ID: <code>{user_id}</code>
-"
-            f"📋 Тариф: {plan_name}
-"
-            f"💵 Сумма: <b>{amount:.0f}₽</b>
-"
-            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-
-        await self.send_notification(admin_id, text)
-
-    async def admin_server_offline(self, admin_id: int, server_name: str):
-        """Уведомление админу о недоступном сервере"""
-        text = (
-            f"🔴 <b>Сервер недоступен!</b>
-
-"
-            f"📡 <b>{server_name}</b>
-"
-            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-"
-            f"Проверьте сервер срочно!"
-        )
-
-        await self.send_notification(admin_id, text)
-
-    async def admin_low_traffic_alert(self, admin_id: int, server_name: str,
-                                       remaining_percent: float):
-        """Уведомление админу о заканчивающемся трафике на сервере"""
-        text = (
-            f"⚠️ <b>Трафик на сервере заканчивается!</b>
-
-"
-            f"📡 <b>{server_name}</b>
-"
-            f"📊 Осталось: <b>{remaining_percent:.1f}%</b>
-
-"
-            f"Рассмотрите добавление трафика или новый сервер."
-        )
-
-        await self.send_notification(admin_id, text)
-
-    # ==================== BROADCAST ====================
-
-    async def broadcast(self, telegram_ids: List[int], text: str, 
-                        reply_markup: Optional[InlineKeyboardMarkup] = None):
-        """Массовая рассылка (с rate limiting)"""
+    async def broadcast(self, user_ids: List[int], message: str, parse_mode: str = "HTML", 
+                       keyboard: Optional[InlineKeyboardMarkup] = None, rate_limit: float = 0.05):
+        """Массовая рассылка с rate limiting"""
         success = 0
         failed = 0
 
-        for tg_id in telegram_ids:
-            if await self.send_notification(tg_id, text, reply_markup):
+        for user_id in user_ids:
+            try:
+                await self.bot.send_message(user_id, message, parse_mode=parse_mode, reply_markup=keyboard)
                 success += 1
-            else:
+                await asyncio.sleep(rate_limit)
+            except Exception:
                 failed += 1
 
-            # Rate limit: 30 messages/second
-            if (success + failed) % 30 == 0:
-                await asyncio.sleep(1)
-
-        logger.info(f"Broadcast: {success} sent, {failed} failed")
         return {"sent": success, "failed": failed}
+
+    @staticmethod
+    def _plural_days(n: int) -> str:
+        if n % 10 == 1 and n % 100 != 11:
+            return "день"
+        elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
+            return "дня"
+        else:
+            return "дней"
