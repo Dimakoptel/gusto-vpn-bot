@@ -5,6 +5,7 @@ GUSTO VPN Bot v2.0 — Production Ready
 import asyncio
 import logging
 import sys
+import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from io import BytesIO
@@ -25,6 +26,17 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("/var/log/gusto-bot.log") if os.path.exists("/var/log") else logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("gusto.bot")
+
 # ==================== CONFIGURATION (loaded from API) ====================
 class BotConfig:
     """Динамическая конфигурация — загружается из backend API"""
@@ -43,24 +55,34 @@ class BotConfig:
         url = backend_url or self.backend_url
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Get system settings
+                # Get system settings (public endpoint)
                 resp = await client.get(f"{url}/api/settings/health")
                 if resp.status_code != 200:
-                    logging.error(f"❌ Backend unavailable: {resp.status_code}")
+                    logger.error(f"❌ Backend unavailable: {resp.status_code}")
                     return False
 
                 health = resp.json()
                 self.maintenance_mode = health.get("maintenance_mode", False)
 
-                # Get full settings (admin endpoint)
-                # For bot we need public endpoints only
-                # Bot token must be set via environment on first start
+                # Try to get full settings (may require auth, so catch 401)
+                try:
+                    settings_resp = await client.get(f"{url}/api/settings/")
+                    if settings_resp.status_code == 200:
+                        settings = settings_resp.json()
+                        self.admin_ids = settings.get("admin_ids", [])
+                        self.support_username = settings.get("support_username", "")
+                        self.welcome_message = settings.get("welcome_message", self.welcome_message)
+                        logger.info(f"✅ Loaded dynamic config: {len(self.admin_ids)} admins")
+                    elif settings_resp.status_code == 401:
+                        logger.warning("⚠️ Settings endpoint requires auth, using defaults for admin_ids")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not load full settings: {e}")
 
                 self._initialized = True
                 return True
 
         except Exception as e:
-            logging.error(f"❌ Failed to load config: {e}")
+            logger.error(f"❌ Failed to load config: {e}")
             return False
 
     def is_admin(self, telegram_id: int) -> bool:
@@ -68,17 +90,6 @@ class BotConfig:
 
 # Global config instance
 config = BotConfig()
-
-# ==================== LOGGING ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/var/log/gusto-bot.log") if os.path.exists("/var/log") else logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("gusto.bot")
 
 # ==================== HTTP CLIENT (with retries) ====================
 class BackendClient:
@@ -119,7 +130,7 @@ class BackendClient:
                 resp = await self.client.request(method, url, **kwargs)
 
                 if resp.status_code == 200:
-                    self._circuit_failures = 0  # Reset on success
+                    self._circuit_failures = 0
                     return resp.json()
 
                 if resp.status_code == 429:
@@ -128,6 +139,10 @@ class BackendClient:
                     await asyncio.sleep(retry_after)
                     continue
 
+                if resp.status_code in (401, 403):
+                    logger.error(f"❌ Auth error {resp.status_code} for {endpoint}")
+                    return {"error": True, "detail": f"HTTP {resp.status_code}", "status_code": resp.status_code}
+
                 if resp.status_code in (500, 502, 503, 504):
                     self._circuit_failures += 1
                     if self._circuit_failures >= self._circuit_threshold:
@@ -135,12 +150,11 @@ class BackendClient:
                         self._circuit_reset_time = datetime.utcnow() + timedelta(minutes=2)
                         logger.error("🔒 Circuit breaker OPENED")
 
-                    wait = 2 ** attempt  # Exponential backoff
+                    wait = 2 ** attempt
                     logger.warning(f"🔄 Server error {resp.status_code}, retry in {wait}s (attempt {attempt+1})")
                     await asyncio.sleep(wait)
                     continue
 
-                # Client error — don't retry
                 logger.error(f"❌ HTTP {resp.status_code}: {resp.text[:200]}")
                 return {"error": True, "detail": f"HTTP {resp.status_code}", "status_code": resp.status_code}
 
@@ -201,7 +215,7 @@ class RateLimiter:
     """Rate limiter для рассылок и API вызовов"""
 
     def __init__(self, max_rate: float = 1.0, burst: int = 5):
-        self.max_rate = max_rate  # messages per second
+        self.max_rate = max_rate
         self.burst = burst
         self.tokens = burst
         self.last_update = datetime.utcnow()
@@ -223,7 +237,7 @@ class RateLimiter:
 
 # Global instances
 backend: Optional[BackendClient] = None
-rate_limiter = RateLimiter(max_rate=1.0, burst=5)  # 1 msg/sec for broadcasts
+rate_limiter = RateLimiter(max_rate=1.0, burst=5)
 
 # ==================== QR GENERATOR ====================
 def generate_qr_code(config_link: str, caption: str = "") -> BytesIO:
@@ -306,7 +320,7 @@ class MaintenanceMiddleware:
         if isinstance(event, Message) and config.maintenance_mode:
             if not config.is_admin(event.from_user.id):
                 await event.answer(
-                    "🔧 <b>Технические работы</b>\n\n"
+                    "🔧 **Технические работы**\n\n"
                     "Сервис временно недоступен.\n"
                     "Попробуйте позже."
                 )
@@ -318,7 +332,6 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
     """Инициализация бота с загрузкой конфигурации"""
 
     # Load from environment first (required for token)
-    import os
     bot_token = os.getenv("BOT_TOKEN", "")
     backend_url = os.getenv("BACKEND_URL", "http://gusto-backend:8000")
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/1")
@@ -396,15 +409,15 @@ def register_handlers(dp: Dispatcher):
         is_admin = user.get("is_admin", False) if user and not user.get("error") else False
 
         welcome_text = (
-            f"🚀 <b>Добро пожаловать в GUSTO VPN!</b>\n\n"
+            f"🚀 **Добро пожаловать в GUSTO VPN!**\n\n"
             f"Привет, {first_name}! 👋\n\n"
-            f"<b>Что такое GUSTO?</b>\n"
+            f" **Что такое GUSTO?**\n"
             f"• ⚡ Максимальная скорость (XTLS-Reality)\n"
             f"• 🌍 10+ серверов в Европе и Азии\n"
             f"• 🔒 Военное шифрование\n"
             f"• 📱 До 5 устройств\n"
             f"• 💰 Оплата картой, криптой, СБП\n\n"
-            f"<i>Быстрый. Безопасный. Без границ.</i>\n\n"
+            f" _Быстрый. Безопасный. Без границ._\n\n"
             f"Выберите действие 👇"
         )
 
@@ -427,7 +440,7 @@ def register_handlers(dp: Dispatcher):
 
         if not plans:
             await callback.message.edit_text(
-                "😔 <b>Тарифы временно недоступны</b>\n\n"
+                "😔 **Тарифы временно недоступны**\n\n"
                 "Попробуйте позже или обратитесь в поддержку.",
                 reply_markup=back_kb("main")
             )
@@ -454,14 +467,14 @@ def register_handlers(dp: Dispatcher):
         kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="main")])
 
         await callback.message.edit_text(
-            "📋 <b>GUSTO Тарифы</b>\n\n"
+            "📋 **GUSTO Тарифы**\n\n"
             "Все тарифы включают:\n"
             "• ⚡ VLESS + Reality (обход DPI)\n"
             "• 🔄 Smart Router (автовыбор сервера)\n"
             "• 📱 До 5 устройств\n"
             "• 🛡️ GUSTO Shield (антифрод)\n"
             "• 💬 Поддержка 24/7\n\n"
-            "<i>⭐ Популярный выбор — GUSTO Про</i>",
+            " _⭐ Популярный выбор — GUSTO Про_",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
         )
 
@@ -497,10 +510,10 @@ def register_handlers(dp: Dispatcher):
         ])
 
         await callback.message.edit_text(
-            f"✅ <b>{name}</b>\n\n"
-            f"📊 Трафик: <b>{traffic} GB</b>\n"
-            f"📅 Срок: <b>{days} дней</b>\n"
-            f"💰 Сумма: <b>{price}₽</b>\n\n"
+            f"✅ **{name}**\n\n"
+            f"📊 Трафик: **{traffic} GB**\n"
+            f"📅 Срок: **{days} дней**\n"
+            f"💰 Сумма: **{price}₽**\n\n"
             f"Выберите способ оплаты:",
             reply_markup=payment_kb
         )
@@ -578,12 +591,12 @@ def register_handlers(dp: Dispatcher):
         amount = payment.get("amount", plan["price"])
 
         await callback.message.edit_text(
-            f"🏦 <b>Оплата через {methods.get(method)}</b>\n\n"
-            f"Сумма: <b>{amount}₽</b>\n"
-            f"Тариф: <b>{plan.get('display_name') or plan['name']}</b>\n\n"
+            f"🏦 **Оплата через {methods.get(method)}**\n\n"
+            f"Сумма: **{amount}₽**\n"
+            f"Тариф: **{plan.get('display_name') or plan['name']}**\n\n"
             f"Нажмите кнопку ниже для оплаты.\n"
-            f"После оплаты нажмите <b>🔄 Проверить оплату</b>.\n\n"
-            f"<i>⏳ У вас есть 30 минут для оплаты</i>",
+            f"После оплаты нажмите **🔄 Проверить оплату**.\n\n"
+            f" _⏳ У вас есть 30 минут для оплаты_",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
                 [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_pay:{payment['id']}")],
@@ -639,15 +652,15 @@ def register_handlers(dp: Dispatcher):
                         await callback.message.answer_photo(
                             photo=qr_file,
                             caption=(
-                                f"🎉 <b>Оплата успешна!</b>\n\n"
-                                f"✅ Подписка <b>{plan_name}</b> активирована\n\n"
-                                f"🔑 <b>Ваша конфигурация:</b>\n"
-                                f"<code>{config_link}</code>\n\n"
-                                f"📱 <b>Как подключить:</b>\n"
-                                f"1. <b>Android:</b> V2RayNG или NekoBox\n"
-                                f"2. <b>iOS:</b> Streisand или Shadowrocket\n"
-                                f"3. <b>Windows:</b> NekoRay или v2rayN\n"
-                                f"4. <b>macOS:</b> V2RayXS или V2RayU\n\n"
+                                f"🎉 **Оплата успешна!**\n\n"
+                                f"✅ Подписка **{plan_name}** активирована\n\n"
+                                f"🔑 **Ваша конфигурация:**\n"
+                                f" `{config_link}`\n\n"
+                                f"📱 **Как подключить:**\n"
+                                f"1. **Android:** V2RayNG или NekoBox\n"
+                                f"2. **iOS:** Streisand или Shadowrocket\n"
+                                f"3. **Windows:** NekoRay или v2rayN\n"
+                                f"4. **macOS:** V2RayXS или V2RayU\n\n"
                                 f"Отсканируйте QR-код или скопируйте ссылку! 🚀"
                             ),
                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -659,11 +672,11 @@ def register_handlers(dp: Dispatcher):
                         logger.error(f"❌ QR generation failed: {e}")
                         # Fallback without QR
                         await callback.message.edit_text(
-                            f"🎉 <b>Оплата успешна!</b>\n\n"
-                            f"✅ Подписка <b>{plan_name}</b> активирована\n\n"
-                            f"🔑 <b>Ваша конфигурация:</b>\n"
-                            f"<code>{config_link}</code>\n\n"
-                            f"📱 <b>Как подключить:</b>\n"
+                            f"🎉 **Оплата успешна!**\n\n"
+                            f"✅ Подписка **{plan_name}** активирована\n\n"
+                            f"🔑 **Ваша конфигурация:**\n"
+                            f" `{config_link}`\n\n"
+                            f"📱 **Как подключить:**\n"
                             f"1. Android: V2RayNG или NekoBox\n"
                             f"2. iOS: Streisand или Shadowrocket\n"
                             f"3. Windows: NekoRay или v2rayN\n"
@@ -677,7 +690,7 @@ def register_handlers(dp: Dispatcher):
                     return
 
             await callback.message.edit_text(
-                "🎉 <b>Оплата успешна!</b>\n\n"
+                "🎉 **Оплата успешна!**\n\n"
                 "Ваша подписка активируется в течение минуты.\n"
                 "Проверьте раздел 'Мой кабинет'.",
                 reply_markup=main_menu_kb()
@@ -693,7 +706,7 @@ def register_handlers(dp: Dispatcher):
     async def cb_cancel_payment(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.message.edit_text(
-            "❌ <b>Оплата отменена</b>\n\n"
+            "❌ **Оплата отменена**\n\n"
             "Вы можете попробовать снова в любое время.",
             reply_markup=main_menu_kb()
         )
@@ -740,20 +753,20 @@ def register_handlers(dp: Dispatcher):
 
                 subs_text += (
                     f"📡 {server_name} {flag}\n"
-                    f"  📅 {days_left}д | 📊 {traffic_used:.1f}/{traffic_total}GB\n"
+                    f" 📅 {days_left}д | 📊 {traffic_used:.1f}/{traffic_total}GB\n"
                 )
         else:
             subs_text = "❌ Нет активных подписок\n"
 
         await callback.message.edit_text(
-            f"👤 <b>Мой GUSTO</b>\n\n"
-            f"├ ID: <code>{user['id']}</code>\n"
+            f"👤 **Мой GUSTO**\n\n"
+            f"├ ID: `{user['id']}`\n"
             f"├ Подписки: {len(active_subs)} активных\n"
             f"├ 💰 Баланс: {float(user.get('referral_balance', 0)):.2f}₽\n"
             f"├ 👥 Рефералов: {user.get('referral_count', 0)}\n"
             f"└ 🏆 Уровень: {user.get('referral_level', 0)}\n\n"
-            f"<b>Активные подписки:</b>\n{subs_text}\n"
-            f"<code>https://t.me/gustovpn_bot?start=ref_{user['id']}</code>",
+            f" **Активные подписки:**\n{subs_text}\n"
+            f" `https://t.me/gustovpn_bot?start=ref_{user['id']}`",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📊 Мои подписки", callback_data="subs")],
                 [InlineKeyboardButton(text="🔑 Получить конфиг", callback_data="config")],
@@ -775,7 +788,7 @@ def register_handlers(dp: Dispatcher):
 
         if not subs:
             await callback.message.edit_text(
-                "📊 <b>Мои подписки</b>\n\n"
+                "📊 **Мои подписки**\n\n"
                 "У вас пока нет подписок.\n"
                 "Купите VPN в главном меню!",
                 reply_markup=back_kb("account")
@@ -794,7 +807,7 @@ def register_handlers(dp: Dispatcher):
         kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="account")])
 
         await callback.message.edit_text(
-            f"📊 <b>Мои подписки</b>\n\n"
+            f"📊 **Мои подписки**\n\n"
             f"Всего: {len(subs)}\n"
             f"Активных: {len([s for s in subs if s.get('status') == 'active'])}\n\n"
             f"Выберите подписку для подробностей:",
@@ -831,14 +844,14 @@ def register_handlers(dp: Dispatcher):
         server = sub.get("server", {})
 
         await callback.message.edit_text(
-            f"📡 <b>Подписка #{sub_id}</b>\n\n"
+            f"📡 **Подписка #{sub_id}**\n\n"
             f"🌍 Сервер: {server.get('name', 'N/A')} {server.get('flag_emoji', '')}\n"
             f"🔒 Протокол: {sub.get('protocol', 'vless').upper()} + {sub.get('security', 'reality').upper()}\n"
             f"📅 Действует до: {expires[:10] if expires else 'N/A'}\n"
             f"⏳ Осталось: {days_left} дней\n"
             f"📊 Трафик: {traffic_used:.1f} / {traffic_total} GB\n\n"
-            f"🔑 <b>Конфигурация:</b>\n"
-            f"<code>{config_link}</code>",
+            f"🔑 **Конфигурация:**\n"
+            f" `{config_link}`",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Копировать", callback_data=f"copy_config:{sub_id}")],
                 [InlineKeyboardButton(text="📷 QR-код", callback_data=f"qr_config:{sub_id}")],
@@ -865,14 +878,14 @@ def register_handlers(dp: Dispatcher):
         config_link = sub.get("config_link", "")
 
         await callback.message.answer(
-            f"🔑 <b>Ваша конфигурация:</b>\n\n"
-            f"<code>{config_link}</code>\n\n"
+            f"🔑 **Ваша конфигурация:**\n\n"
+            f" `{config_link}`\n\n"
             f"Нажмите на ссылку выше, чтобы скопировать.\n\n"
-            f"📱 <b>Как подключить:</b>\n"
-            f"1. <b>Android:</b> V2RayNG или NekoBox\n"
-            f"2. <b>iOS:</b> Streisand или Shadowrocket\n"
-            f"3. <b>Windows:</b> NekoRay или v2rayN\n"
-            f"4. <b>macOS:</b> V2RayXS или V2RayU\n\n"
+            f"📱 **Как подключить:**\n"
+            f"1. **Android:** V2RayNG или NekoBox\n"
+            f"2. **iOS:** Streisand или Shadowrocket\n"
+            f"3. **Windows:** NekoRay или v2rayN\n"
+            f"4. **macOS:** V2RayXS или V2RayU\n\n"
             f"Вставьте ссылку в приложение и подключайтесь! 🚀"
         )
         await callback.answer("✅ Конфигурация отправлена")
@@ -901,8 +914,8 @@ def register_handlers(dp: Dispatcher):
 
             await callback.message.answer_photo(
                 photo=qr_file,
-                caption=f"📷 <b>QR-код для {server_name}</b>\n\n"
-                        f"Отсканируйте в приложении V2RayNG/Streisand"
+                caption=f"📷 **QR-код для {server_name}**\n\n"
+                      f"Отсканируйте в приложении V2RayNG/Streisand"
             )
             await callback.answer("✅ QR-код отправлен")
         except Exception as e:
@@ -941,7 +954,7 @@ def register_handlers(dp: Dispatcher):
         kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="account")])
 
         await callback.message.edit_text(
-            "🔄 <b>Продление подписки</b>\n\n"
+            "🔄 **Продление подписки**\n\n"
             "Выберите подписку для продления:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
         )
@@ -978,7 +991,7 @@ def register_handlers(dp: Dispatcher):
         kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="renew")])
 
         await callback.message.edit_text(
-            "🔄 <b>Выберите тариф для продления</b>\n\n"
+            "🔄 **Выберите тариф для продления**\n\n"
             "Вы можете продлить на тот же или другой тариф:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
         )
@@ -1004,19 +1017,19 @@ def register_handlers(dp: Dispatcher):
         ref_link = f"https://t.me/gustovpn_bot?start=ref_{user['id']}"
 
         await callback.message.edit_text(
-            f"🤝 <b>GUSTO Партнерка</b>\n\n"
+            f"🤝 **GUSTO Партнерка**\n\n"
             f"Приглашайте друзей и зарабатывайте!\n\n"
-            f"<b>Уровни комиссии:</b>\n"
-            f"• 🥇 1 уровень: <b>30%</b>\n"
-            f"• 🥈 2 уровень: <b>15%</b>\n"
-            f"• 🥉 3 уровень: <b>5%</b>\n\n"
-            f"<b>Ваша статистика:</b>\n"
+            f" **Уровни комиссии:**\n"
+            f"• 🥇 1 уровень: **30%**\n"
+            f"• 🥈 2 уровень: **15%**\n"
+            f"• 🥉 3 уровень: **5%**\n\n"
+            f" **Ваша статистика:**\n"
             f"├ Рефералов: {stats.get('total_referrals', 0)}\n"
             f"├ Заработано: {float(stats.get('total_earned', 0)):.2f}₽\n"
             f"├ Баланс: {float(stats.get('referral_balance', 0)):.2f}₽\n"
             f"└ Уровень: {stats.get('level', 0)}\n\n"
-            f"<b>Ваша ссылка:</b>\n"
-            f"<code>{ref_link}</code>\n\n"
+            f" **Ваша ссылка:**\n"
+            f" `{ref_link}`\n\n"
             f"Минимум для вывода: 500₽",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Копировать ссылку", callback_data="copy_ref")],
@@ -1031,7 +1044,7 @@ def register_handlers(dp: Dispatcher):
             user = await backend.get_user(callback.from_user.id)
             if user and not user.get("error"):
                 ref_link = f"https://t.me/gustovpn_bot?start=ref_{user['id']}"
-                await callback.message.answer(f"🔗 <b>Ваша реферальная ссылка:</b> <code>{ref_link}</code>")
+                await callback.message.answer(f"🔗 **Ваша реферальная ссылка:** `{ref_link}`")
                 await callback.answer("✅ Ссылка отправлена")
         except Exception as e:
             logger.error(f"❌ Error: {e}")
@@ -1051,11 +1064,11 @@ def register_handlers(dp: Dispatcher):
         ])
 
         await callback.message.edit_text(
-            "❓ <b>GUSTO Support</b>\n\n"
+            "❓ **GUSTO Support**\n\n"
             "Если нужна помощь:\n"
             "• Пишите: @gusto_support\n"
             "• Или напишите сюда сообщение\n\n"
-            "<i>GUSTO — Быстрый. Безопасный. Без границ.</i>",
+            " _GUSTO — Быстрый. Безопасный. Без границ._",
             reply_markup=kb
         )
 
@@ -1063,7 +1076,7 @@ def register_handlers(dp: Dispatcher):
     async def cb_write_support(callback: CallbackQuery, state: FSMContext):
         await state.set_state(SupportFlow.write_message)
         await callback.message.edit_text(
-            "✏️ <b>Напишите ваше сообщение:</b>\n\n"
+            "✏️ **Напишите ваше сообщение:**\n\n"
             "Опишите проблему или вопрос.\n"
             "Мы ответим в ближайшее время.",
             reply_markup=back_kb("support")
@@ -1078,9 +1091,9 @@ def register_handlers(dp: Dispatcher):
             user = None
 
         support_text = (
-            f"📩 <b>Новое обращение</b>\n\n"
+            f"📩 **Новое обращение**\n\n"
             f"От: {message.from_user.full_name} (@{message.from_user.username or 'N/A'})\n"
-            f"ID: <code>{message.from_user.id}</code>\n"
+            f"ID: `{message.from_user.id}`\n"
             f"User ID: {user['id'] if user and not user.get('error') else 'N/A'}\n\n"
             f"Сообщение:\n{message.text}"
         )
@@ -1100,7 +1113,7 @@ def register_handlers(dp: Dispatcher):
                 logger.error(f"❌ Failed to send to admin {admin_id}: {e}")
 
         await message.answer(
-            "✅ <b>Сообщение отправлено!</b>\n\n"
+            "✅ **Сообщение отправлено!**\n\n"
             "Мы ответим вам в ближайшее время.\n"
             "Обычно ответ занимает до 2 часов.",
             reply_markup=main_menu_kb()
@@ -1118,7 +1131,7 @@ def register_handlers(dp: Dispatcher):
         await state.set_state(AdminFlow.select_action)
 
         await callback.message.edit_text(
-            "🔧 <b>Админ-панель GUSTO</b>\n\n"
+            "🔧 **Админ-панель GUSTO**\n\n"
             "Выберите действие:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
@@ -1138,9 +1151,9 @@ def register_handlers(dp: Dispatcher):
 
         await state.set_state(AdminFlow.broadcast_message)
         await callback.message.edit_text(
-            "📢 <b>Массовая рассылка</b>\n\n"
+            "📢 **Массовая рассылка**\n\n"
             "Введите сообщение для отправки всем пользователям:\n"
-            "<i>Поддерживается HTML-разметка</i>",
+            " _Поддерживается HTML-разметка_",
             reply_markup=back_kb("admin")
         )
 
@@ -1188,7 +1201,7 @@ def register_handlers(dp: Dispatcher):
                 await message.answer(f"⏳ Отправлено: {sent}, Ошибок: {failed}")
 
         await message.answer(
-            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"✅ **Рассылка завершена!**\n\n"
             f"📤 Отправлено: {sent}\n"
             f"❌ Ошибок: {failed}",
             reply_markup=main_menu_kb(is_admin=True)
@@ -1208,7 +1221,7 @@ def register_handlers(dp: Dispatcher):
             is_admin = False
 
         await callback.message.edit_text(
-            "🚀 <b>GUSTO VPN</b>\n\n"
+            "🚀 **GUSTO VPN**\n\n"
             "Выберите действие 👇",
             reply_markup=main_menu_kb(is_admin)
         )
@@ -1223,7 +1236,7 @@ def register_handlers(dp: Dispatcher):
         if event.update.message:
             try:
                 await event.update.message.answer(
-                    "❌ <b>Произошла ошибка</b>\n\n"
+                    "❌ **Произошла ошибка**\n\n"
                     "Мы уже работаем над исправлением.\n"
                     "Попробуйте позже."
                 )
@@ -1283,7 +1296,6 @@ async def main():
         await shutdown("FINALLY")
 
 if __name__ == "__main__":
-    import os
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

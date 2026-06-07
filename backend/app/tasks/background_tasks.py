@@ -1,210 +1,292 @@
-"""Background Tasks — APScheduler
-Проверка подписок, удаление истекших, мониторинг серверов, сбор трафика, бэкап
-"""
+"""Background Tasks — APScheduler"""
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from app.database import async_session_maker
+from app.services.config_service import ConfigService
 from app.services.subscription_service import SubscriptionService
 from app.services.notification_service import NotificationService
 from app.services.x3ui_client import GustoX3UIClient, X3UIPanel
 from app.models.server import GustoServer
 from app.models.subscription import GustoSubscription, SubscriptionStatus
-from sqlalchemy import select, update
+from sqlalchemy import select, and_
 
-logger = logging.getLogger("gusto.tasks")
+logger = logging.getLogger("gusto.background")
+
 scheduler = AsyncIOScheduler()
 
-async def check_expiring_subscriptions():
-    """Проверить подписки, истекающие через 3/1/0 дней"""
-    async with async_session_maker() as db:
-        notify = NotificationService(db)
-
-        now = datetime.utcnow()
-
-        # 3 days before expiry
-        three_days = now + timedelta(days=3)
-        result = await db.execute(
-            select(GustoSubscription).where(
-                GustoSubscription.status == SubscriptionStatus.ACTIVE,
-                GustoSubscription.expires_at <= three_days,
-                GustoSubscription.expires_at > now + timedelta(days=2)
-            )
-        )
-        for sub in result.scalars().all():
-            await notify.subscription_expiring_soon(sub.user_id, sub.email, days=3)
-
-        # 1 day before expiry
-        one_day = now + timedelta(days=1)
-        result = await db.execute(
-            select(GustoSubscription).where(
-                GustoSubscription.status == SubscriptionStatus.ACTIVE,
-                GustoSubscription.expires_at <= one_day,
-                GustoSubscription.expires_at > now
-            )
-        )
-        for sub in result.scalars().all():
-            await notify.subscription_expiring_soon(sub.user_id, sub.email, days=1)
-
-        # Today expired
-        result = await db.execute(
-            select(GustoSubscription).where(
-                GustoSubscription.status == SubscriptionStatus.ACTIVE,
-                GustoSubscription.expires_at <= now
-            )
-        )
-        for sub in result.scalars().all():
-            await notify.subscription_expired(sub.user_id, sub.email)
-
-        logger.info(f"✅ Checked expiring subscriptions at {now}")
-
-async def cleanup_expired_subscriptions():
-    """Деактивировать истекшие подписки и удалить из 3x-ui"""
+async def check_expired_subscriptions():
+    """Проверить и деактивировать истекшие подписки"""
     async with async_session_maker() as db:
         service = SubscriptionService(db)
-        deactivated = await service.deactivate_expired()
-        logger.info(f"✅ Deactivated {len(deactivated)} expired subscriptions")
+        try:
+            deactivated = await service.deactivate_expired()
+            if deactivated:
+                logger.info(f"✅ Deactivated {len(deactivated)} expired subscriptions")
+        except Exception as e:
+            logger.error(f"❌ Error checking expired subscriptions: {e}")
+
+async def delete_expired_subscriptions():
+    """Удалить подписки, истекшие более 7 дней назад"""
+    async with async_session_maker() as db:
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            result = await db.execute(
+                select(GustoSubscription).where(
+                    and_(
+                        GustoSubscription.status == SubscriptionStatus.EXPIRED,
+                        GustoSubscription.expires_at < cutoff
+                    )
+                )
+            )
+            to_delete = result.scalars().all()
+            for sub in to_delete:
+                await db.delete(sub)
+            await db.commit()
+            if to_delete:
+                logger.info(f"✅ Deleted {len(to_delete)} old expired subscriptions")
+        except Exception as e:
+            logger.error(f"❌ Error deleting expired subscriptions: {e}")
 
 async def monitor_servers():
-    """Проверить доступность серверов (TCP ping)"""
+    """Мониторинг серверов (ping, статус)"""
     async with async_session_maker() as db:
-        result = await db.execute(select(GustoServer).where(GustoServer.is_active == True))
-        servers = result.scalars().all()
+        try:
+            result = await db.execute(
+                select(GustoServer).where(GustoServer.is_active == True)
+            )
+            servers = result.scalars().all()
 
-        for server in servers:
-            try:
-                import socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                await asyncio.get_event_loop().run_in_executor(None, sock.connect, (server.host, server.port))
-                sock.close()
+            for server in servers:
+                try:
+                    panel = X3UIPanel(
+                        host=server.host,
+                        port=server.port,
+                        api_token=server.panel_api_token,
+                        name=server.name
+                    )
+                    x3ui = GustoX3UIClient(panel)
 
-                server.is_online = True
-                server.last_ping = datetime.utcnow()
-                server.ping_ms = 50  # Placeholder
+                    # Get server status
+                    status = await x3ui.get_server_status()
+                    if status:
+                        server.is_online = True
+                        server.cpu_load = status.get("cpu", 0)
+                        server.memory_used = status.get("mem", {}).get("current", 0) / 1073741824
+                        server.memory_total = status.get("mem", {}).get("total", 1) / 1073741824
+                        server.network_in = status.get("netTraffic", {}).get("sent", 0)
+                        server.network_out = status.get("netTraffic", {}).get("recv", 0)
+                        server.total_users = status.get("xray", {}).get("inbounds", 0)
+                        server.last_ping = datetime.utcnow()
+                        server.consecutive_fails = 0
+                    else:
+                        server.consecutive_fails += 1
+                        if server.consecutive_fails >= 3:
+                            server.is_online = False
+                            notify = NotificationService(db)
+                            await notify.admin_server_offline(
+                                server.name, server.host, "No response"
+                            )
 
-            except Exception as e:
-                server.is_online = False
-                server.consecutive_fails = (server.consecutive_fails or 0) + 1
-                logger.warning(f"⚠️ Server {server.name} ({server.host}) offline: {e}")
+                    await x3ui.close()
+                except Exception as e:
+                    server.consecutive_fails += 1
+                    if server.consecutive_fails >= 3:
+                        server.is_online = False
+                        notify = NotificationService(db)
+                        await notify.admin_server_offline(server.name, server.host, str(e))
+                    logger.error(f"❌ Server {server.name} check failed: {e}")
 
-                # Notify admins if server is down
-                if server.consecutive_fails >= 3:
-                    notify = NotificationService(db)
-                    await notify.admin_server_offline(server.name, server.host, str(e))
+            await db.commit()
+        except Exception as e:
+            logger.error(f"❌ Error monitoring servers: {e}")
 
-        await db.commit()
-        logger.info(f"✅ Monitored {len(servers)} servers")
-
-async def collect_traffic_stats():
-    """Обновить статистику трафика из 3x-ui"""
+async def update_traffic_stats():
+    """Обновить статистику трафика"""
     async with async_session_maker() as db:
         service = SubscriptionService(db)
-        await service.update_traffic_stats()
-        logger.info("✅ Traffic stats updated")
+        try:
+            await service.update_traffic_stats()
+            logger.info("✅ Traffic stats updated")
+        except Exception as e:
+            logger.error(f"❌ Error updating traffic stats: {e}")
 
-async def check_pending_payments():
-    """Проверить просроченные платежи"""
+async def check_low_traffic():
+    """Проверить пользователей с малым трафиком"""
     async with async_session_maker() as db:
-        from app.models.payment import GustoPayment, PaymentStatus
+        try:
+            config_service = ConfigService(db)
+            notify_config = await config_service.get_notification_config()
+            threshold = notify_config.get("low_traffic_gb", 5.0)
 
-        now = datetime.utcnow()
-        result = await db.execute(
-            select(GustoPayment).where(
-                GustoPayment.status == PaymentStatus.PENDING,
-                GustoPayment.created_at < now - timedelta(hours=1)
+            result = await db.execute(
+                select(GustoSubscription).where(
+                    and_(
+                        GustoSubscription.status == SubscriptionStatus.ACTIVE,
+                        GustoSubscription.total_gb - GustoSubscription.used_gb < threshold
+                    )
+                )
             )
-        )
-        expired = result.scalars().all()
+            low_traffic = result.scalars().all()
 
-        for payment in expired:
-            payment.status = PaymentStatus.FAILED
-            logger.info(f"⏳ Payment #{payment.id} expired (created at {payment.created_at})")
+            notify = NotificationService(db)
+            for sub in low_traffic:
+                remaining = sub.total_gb - sub.used_gb
+                await notify.low_traffic(sub.user_id, sub.email, remaining)
 
-        await db.commit()
-        logger.info(f"✅ Checked {len(expired)} expired payments")
+            if low_traffic:
+                logger.info(f"✅ Notified {len(low_traffic)} users about low traffic")
+        except Exception as e:
+            logger.error(f"❌ Error checking low traffic: {e}")
 
-async def backup_database():
-    """Бэкап PostgreSQL (если запущен в Docker)"""
-    import subprocess
-    import os
-    from datetime import datetime
+async def check_expiring_subscriptions():
+    """Уведомить о скором истечении подписки"""
+    async with async_session_maker() as db:
+        try:
+            config_service = ConfigService(db)
+            notify_config = await config_service.get_notification_config()
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    backup_dir = "/backups"
-    os.makedirs(backup_dir, exist_ok=True)
+            now = datetime.utcnow()
+            notify = NotificationService(db)
 
-    filename = f"{backup_dir}/gusto_backup_{timestamp}.sql.gz"
+            # 3 days
+            if notify_config.get("expiry_3days", True):
+                in_3_days = now + timedelta(days=3)
+                result = await db.execute(
+                    select(GustoSubscription).where(
+                        and_(
+                            GustoSubscription.status == SubscriptionStatus.ACTIVE,
+                            GustoSubscription.expires_at.between(now, in_3_days),
+                            GustoSubscription.notified_3days == False
+                        )
+                    )
+                )
+                for sub in result.scalars().all():
+                    await notify.subscription_expiring_soon(sub.user_id, sub.email, 3)
+                    sub.notified_3days = True
 
-    try:
-        # This assumes we're in the Docker container with pg_dump available
-        # In production, use S3 upload
-        subprocess.run([
-            "pg_dump", "-h", "postgres", "-U", "gusto", "gusto_vpn", "|", "gzip", ">", filename
-        ], shell=True, check=True, env={**os.environ, "PGPASSWORD": os.getenv("DB_PASSWORD", "gusto_secret_2024")})
+            # 1 day
+            if notify_config.get("expiry_1day", True):
+                in_1_day = now + timedelta(days=1)
+                result = await db.execute(
+                    select(GustoSubscription).where(
+                        and_(
+                            GustoSubscription.status == SubscriptionStatus.ACTIVE,
+                            GustoSubscription.expires_at.between(now, in_1_day),
+                            GustoSubscription.notified_1day == False
+                        )
+                    )
+                )
+                for sub in result.scalars().all():
+                    await notify.subscription_expiring_soon(sub.user_id, sub.email, 1)
+                    sub.notified_1day = True
 
-        logger.info(f"✅ Database backup created: {filename}")
+            # Today
+            if notify_config.get("expiry_today", True):
+                in_1_hour = now + timedelta(hours=1)
+                result = await db.execute(
+                    select(GustoSubscription).where(
+                        and_(
+                            GustoSubscription.status == SubscriptionStatus.ACTIVE,
+                            GustoSubscription.expires_at.between(now, in_1_hour),
+                            GustoSubscription.notified_today == False
+                        )
+                    )
+                )
+                for sub in result.scalars().all():
+                    await notify.subscription_expiring_soon(sub.user_id, sub.email, 0)
+                    sub.notified_today = True
 
-        # Cleanup old backups (keep 30 days)
-        subprocess.run([
-            "find", backup_dir, "-name", "gusto_backup_*.sql.gz", "-mtime", "+30", "-delete"
-        ], check=False)
+            await db.commit()
+        except Exception as e:
+            logger.error(f"❌ Error checking expiring subscriptions: {e}")
 
-    except Exception as e:
-        logger.error(f"❌ Backup failed: {e}")
+async def process_payments():
+    """Проверить незавершенные платежи (fallback)"""
+    async with async_session_maker() as db:
+        try:
+            from app.models.payment import GustoPayment, PaymentStatus
+            result = await db.execute(
+                select(GustoPayment).where(
+                    and_(
+                        GustoPayment.status == PaymentStatus.PENDING,
+                        GustoPayment.created_at < datetime.utcnow() - timedelta(hours=1)
+                    )
+                )
+            )
+            stale = result.scalars().all()
+            for payment in stale:
+                payment.status = PaymentStatus.FAILED
+            await db.commit()
+            if stale:
+                logger.info(f"✅ Marked {len(stale)} stale payments as failed")
+        except Exception as e:
+            logger.error(f"❌ Error processing payments: {e}")
+
+async def daily_backup():
+    """Ежедневный бэкап (запускается через docker-compose)"""
+    logger.info("📦 Daily backup triggered")
+    # Backup logic handled by docker-compose backup service
 
 async def start_scheduler():
-    """Запустить планировщик фоновых задач"""
+    """Запустить все background tasks"""
     scheduler.add_job(
-        check_expiring_subscriptions,
-        trigger=IntervalTrigger(minutes=10),
-        id="check_expiring",
+        check_expired_subscriptions,
+        trigger=IntervalTrigger(minutes=5),
+        id="check_expired",
         replace_existing=True
     )
-
     scheduler.add_job(
-        cleanup_expired_subscriptions,
+        delete_expired_subscriptions,
         trigger=IntervalTrigger(hours=1),
-        id="cleanup_expired",
+        id="delete_expired",
         replace_existing=True
     )
-
     scheduler.add_job(
         monitor_servers,
         trigger=IntervalTrigger(minutes=2),
         id="monitor_servers",
         replace_existing=True
     )
-
     scheduler.add_job(
-        collect_traffic_stats,
-        trigger=IntervalTrigger(minutes=5),
-        id="collect_traffic",
+        update_traffic_stats,
+        trigger=IntervalTrigger(minutes=10),
+        id="update_traffic",
         replace_existing=True
     )
-
     scheduler.add_job(
-        check_pending_payments,
-        trigger=IntervalTrigger(minutes=5),
-        id="check_payments",
+        check_low_traffic,
+        trigger=IntervalTrigger(hours=6),
+        id="check_low_traffic",
         replace_existing=True
     )
-
     scheduler.add_job(
-        backup_database,
+        check_expiring_subscriptions,
+        trigger=IntervalTrigger(minutes=30),
+        id="check_expiring",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        process_payments,
+        trigger=IntervalTrigger(minutes=15),
+        id="process_payments",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        daily_backup,
         trigger=CronTrigger(hour=3, minute=0),
-        id="backup_db",
+        id="daily_backup",
         replace_existing=True
     )
 
     scheduler.start()
-    logger.info("✅ Background scheduler started with 6 jobs")
+    logger.info("✅ Background scheduler started with 7 jobs")
 
 async def stop_scheduler():
-    """Остановить планировщик"""
+    """Остановить scheduler"""
     scheduler.shutdown()
     logger.info("✅ Background scheduler stopped")

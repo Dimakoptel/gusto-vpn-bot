@@ -1,37 +1,30 @@
-from fastapi import APIRouter, Depends, HTTPException
+"""Referrals Router"""
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.database import get_db
-from app.models import GustoUser
-from app.services import GustoReferralEngine
+from app.models.user import GustoUser
 
-router = APIRouter()
-
+router = APIRouter(prefix="/api/referrals", tags=["Referrals"])
 
 @router.get("/stats/{user_id}")
-async def referral_stats(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_referral_stats(user_id: int, db: AsyncSession = Depends(get_db)):
+    """Get referral stats for user"""
     result = await db.execute(select(GustoUser).where(GustoUser.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
-        raise HTTPException(404, "User not found")
+        return {"error": "User not found"}
 
-    engine = GustoReferralEngine(db)
-    ref_count = await engine._get_referral_count(user_id)
+    # Count referrals
+    ref_result = await db.execute(
+        select(func.count(GustoUser.id)).where(GustoUser.referred_by == user_id)
+    )
+    total_referrals = ref_result.scalar()
 
     return {
-        "code": user.referral_code,
-        "balance": float(user.referral_balance),
+        "total_referrals": total_referrals,
         "total_earned": float(user.total_earned),
-        "level": user.referral_level,
-        "referrals_count": ref_count,
-        "link": f"https://t.me/gustovpn_bot?start=ref_{user.referral_code}"
+        "referral_balance": float(user.referral_balance),
+        "level": user.referral_level
     }
-
-
-@router.post("/withdraw/{user_id}")
-async def withdraw_referral(user_id: int, db: AsyncSession = Depends(get_db)):
-    engine = GustoReferralEngine(db)
-    result = await engine.withdraw(user_id)
-    await db.commit()
-    return result

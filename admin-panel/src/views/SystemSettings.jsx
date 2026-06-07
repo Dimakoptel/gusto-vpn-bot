@@ -1,126 +1,85 @@
 import React, { useState, useEffect } from 'react';
-import { Globe, Type, Image, Wrench, AlertTriangle, ToggleLeft, ToggleRight } from 'lucide-react';
+import api from '../services/api';
 
-export default function SystemSettings({ settings, onSave, saving }) {
-  const [form, setForm] = useState({
+const SystemSettings = () => {
+  const [settings, setSettings] = useState({
     app_name: 'GUSTO VPN',
     app_logo_url: '',
     maintenance_mode: false,
   });
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
-    if (settings) {
-      setForm({
-        app_name: settings.app_name || 'GUSTO VPN',
-        app_logo_url: settings.app_logo_url || '',
-        maintenance_mode: settings.maintenance_mode || false,
-      });
-    }
-  }, [settings]);
+    loadSettings();
+  }, []);
 
-  const handleChange = (e) => {
-    const { name, value, type, checked } = e.target;
-    setForm({ ...form, [name]: type === 'checkbox' ? checked : value });
+  const loadSettings = async () => {
+    try {
+      const resp = await api.get('/api/settings/');
+      setSettings(resp.data);
+    } catch (e) {
+      console.error('Failed to load settings:', e);
+    }
   };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    onSave({
-      app_name: form.app_name,
-      app_logo_url: form.app_logo_url,
-      maintenance_mode: form.maintenance_mode,
-    });
+  const handleSave = async () => {
+    setLoading(true);
+    try {
+      await api.patch('/api/settings/system', settings);
+      setMessage('✅ Системные настройки сохранены!');
+      setTimeout(() => setMessage(''), 3000);
+    } catch (e) {
+      setMessage('❌ Ошибка сохранения');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6">
-      <div className="flex items-center gap-2 mb-4">
-        <Globe className="w-5 h-5 text-blue-600" />
-        <h2 className="text-lg font-semibold">Системные настройки</h2>
+    <div className="settings-section">
+      <h2>⚙️ Системные настройки</h2>
+      {message && <div className="alert">{message}</div>}
+
+      <div className="form-group">
+        <label>Название приложения:</label>
+        <input
+          type="text"
+          value={settings.app_name || ''}
+          onChange={e => setSettings({...settings, app_name: e.target.value})}
+          placeholder="GUSTO VPN"
+        />
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="space-y-2">
-          <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-            <Type className="w-4 h-4" />
-            Название приложения
-          </label>
+      <div className="form-group">
+        <label>URL логотипа:</label>
+        <input
+          type="text"
+          value={settings.app_logo_url || ''}
+          onChange={e => setSettings({...settings, app_logo_url: e.target.value})}
+          placeholder="https://example.com/logo.png"
+        />
+      </div>
+
+      <div className="maintenance-toggle">
+        <label className="toggle">
           <input
-            type="text"
-            name="app_name"
-            value={form.app_name}
-            onChange={handleChange}
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-            placeholder="GUSTO VPN"
+            type="checkbox"
+            checked={settings.maintenance_mode}
+            onChange={e => setSettings({...settings, maintenance_mode: e.target.checked})}
           />
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-            <Image className="w-4 h-4" />
-            URL логотипа
-          </label>
-          <input
-            type="url"
-            name="app_logo_url"
-            value={form.app_logo_url}
-            onChange={handleChange}
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-            placeholder="https://example.com/logo.png"
-          />
-        </div>
+          🔧 Режим технических работ
+        </label>
+        <small className="warning">
+          ⚠️ При включении бот будет показывать "Технические работы" всем пользователям (кроме админов)
+        </small>
       </div>
 
-      <div className={`border rounded-lg p-4 ${form.maintenance_mode ? 'border-yellow-200 bg-yellow-50' : 'border-gray-200'}`}>
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Wrench className={`w-5 h-5 ${form.maintenance_mode ? 'text-yellow-600' : 'text-gray-500'}`} />
-            <div>
-              <h3 className="font-medium text-gray-900">Режим обслуживания</h3>
-              <p className="text-sm text-gray-500">
-                {form.maintenance_mode 
-                  ? 'Бот и API недоступны для пользователей' 
-                  : 'Все системы работают нормально'}
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={() => setForm({ ...form, maintenance_mode: !form.maintenance_mode })}
-            className="flex items-center gap-2"
-          >
-            {form.maintenance_mode ? (
-              <ToggleRight className="w-8 h-8 text-yellow-600" />
-            ) : (
-              <ToggleLeft className="w-8 h-8 text-gray-400" />
-            )}
-          </button>
-        </div>
-
-        {form.maintenance_mode && (
-          <div className="mt-3 flex items-center gap-2 text-yellow-700 text-sm">
-            <AlertTriangle className="w-4 h-4" />
-            Внимание: пользователи увидят сообщение "Технические работы"
-          </div>
-        )}
-      </div>
-
-      <div className="flex justify-end">
-        <button
-          type="submit"
-          disabled={saving}
-          className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-        >
-          {saving ? (
-            <>
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-              Сохранение...
-            </>
-          ) : (
-            'Сохранить'
-          )}
-        </button>
-      </div>
-    </form>
+      <button onClick={handleSave} disabled={loading} className="btn-primary">
+        {loading ? 'Сохранение...' : '💾 Сохранить'}
+      </button>
+    </div>
   );
-}
+};
+
+export default SystemSettings;

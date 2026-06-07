@@ -4,7 +4,6 @@ from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from app.database import Base
 
-
 class GustoServer(Base):
     __tablename__ = "gusto_servers"
 
@@ -19,13 +18,15 @@ class GustoServer(Base):
     host = Column(String(255), nullable=False)
     port = Column(Integer, default=54321)
     api_port = Column(Integer, default=443)
-    panel_username = Column(String(255))
-    panel_password = Column(Text)
+    panel_api_token = Column(Text)  # Bearer Token для 3x-ui API
 
     is_active = Column(Boolean, default=True)
     is_online = Column(Boolean, default=False)
     is_premium = Column(Boolean, default=False)
     last_check = Column(DateTime, default=datetime.utcnow)
+    last_ping = Column(DateTime)  # NEW: для background_tasks
+    consecutive_fails = Column(Integer, default=0)  # NEW: для background_tasks
+    ping_ms = Column(Integer, default=0)  # NEW: для background_tasks
 
     cpu_load = Column(Float, default=0)
     memory_used = Column(Float, default=0)

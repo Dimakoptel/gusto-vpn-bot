@@ -1,46 +1,43 @@
-"""GUSTO Payment Model"""
-from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime, Numeric, Enum as SQLEnum
+"""Payment Model — GustoPayment"""
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, Enum
 from sqlalchemy.dialects.postgresql import JSONB
-import enum
 from datetime import datetime
 from app.database import Base
-
+import enum
 
 class PaymentStatus(str, enum.Enum):
     PENDING = "pending"
     SUCCESS = "success"
     FAILED = "failed"
     REFUNDED = "refunded"
-
+    CANCELLED = "cancelled"
 
 class PaymentMethod(str, enum.Enum):
     CRYPTOBOT = "cryptobot"
     YOOKASSA = "yookassa"
     FREEKASSA = "freekassa"
-    REFERRAL = "referral_balance"
-
+    MANUAL = "manual"
 
 class GustoPayment(Base):
     __tablename__ = "gusto_payments"
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("gusto_users.id"), nullable=False)
-    subscription_id = Column(Integer, ForeignKey("gusto_subscriptions.id"), nullable=True)
+    subscription_id = Column(Integer, ForeignKey("gusto_subscriptions.id"))
+    plan_id = Column(Integer, ForeignKey("gusto_plans.id"))
 
-    amount = Column(Numeric(10, 2), nullable=False)
-    currency = Column(String(3), default="RUB")
+    amount = Column(Float, nullable=False)
+    currency = Column(String(10), default="RUB")
+    method = Column(Enum(PaymentMethod), nullable=False)
+    status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
 
-    method = Column(SQLEnum(PaymentMethod), nullable=False)
     provider_payment_id = Column(String(255))
-    provider_data = Column(JSONB)
+    provider_data = Column(JSONB, default=dict)
 
-    status = Column(SQLEnum(PaymentStatus), default=PaymentStatus.PENDING)
     paid_at = Column(DateTime)
-
-    referral_processed = Column(Boolean, default=False)
+    refunded_at = Column(DateTime)
+    refund_amount = Column(Float)
+    refund_reason = Column(Text)
 
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("GustoUser", back_populates="payments")
-    subscription = relationship("GustoSubscription")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

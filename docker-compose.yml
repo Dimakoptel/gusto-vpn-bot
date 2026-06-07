@@ -1,34 +1,30 @@
 version: "3.8"
 
 services:
-  # PostgreSQL Database
   postgres:
-    image: postgres:16-alpine
+    image: postgres:15-alpine
     container_name: gusto-postgres
-    restart: unless-stopped
+    restart: always
     environment:
-      POSTGRES_USER: ${DB_USER:-gusto}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-gusto_secret_2024}
-      POSTGRES_DB: ${DB_NAME:-gusto_vpn}
+      POSTGRES_USER: gusto
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-gusto_password}
+      POSTGRES_DB: gusto
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/backups:/backups
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-gusto} -d ${DB_NAME:-gusto_vpn}"]
+      test: ["CMD-SHELL", "pg_isready -U gusto -d gusto"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - gusto-network
 
-  # Redis Cache & FSM Storage
   redis:
     image: redis:7-alpine
     container_name: gusto-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: always
     volumes:
       - redis_data:/data
     ports:
@@ -41,114 +37,98 @@ services:
     networks:
       - gusto-network
 
-  # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: gusto-backend
-    restart: unless-stopped
+    restart: always
     environment:
-      # Database
-      DATABASE_URL: postgresql+asyncpg://${DB_USER:-gusto}:${DB_PASSWORD:-gusto_secret_2024}@postgres:5432/${DB_NAME:-gusto_vpn}
-      # Redis
+      DATABASE_URL: postgresql+asyncpg://gusto:${DB_PASSWORD:-gusto_password}@postgres:5432/gusto
       REDIS_URL: redis://redis:6379/0
-      # Bot (initial token — will be overridden via admin panel)
-      BOT_TOKEN: ${BOT_TOKEN:-}
-      # Secrets
-      SECRET_KEY: ${SECRET_KEY:-gusto_super_secret_key_change_in_production}
-      # Environment
-      ENVIRONMENT: ${ENVIRONMENT:-production}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     ports:
       - "8000:8000"
     volumes:
       - ./backend:/app
-      - /app/__pycache__
+      - /var/log/gusto:/var/log
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
     networks:
       - gusto-network
 
-  # Telegram Bot
   bot:
     build:
       context: ./bot
       dockerfile: Dockerfile
     container_name: gusto-bot
-    restart: unless-stopped
+    restart: always
     environment:
-      BOT_TOKEN: ${BOT_TOKEN:-}
-      BACKEND_URL: http://backend:8000
+      BOT_TOKEN: ${BOT_TOKEN}
+      BACKEND_URL: http://gusto-backend:8000
       REDIS_URL: redis://redis:6379/1
+    volumes:
+      - ./bot:/app
+      - /var/log/gusto:/var/log
     depends_on:
-      backend:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - backend
+      - redis
     networks:
       - gusto-network
 
-  # Admin Panel (React)
   admin-panel:
     build:
       context: ./admin-panel
       dockerfile: Dockerfile
     container_name: gusto-admin
-    restart: unless-stopped
+    restart: always
     environment:
-      REACT_APP_API_URL: http://backend:8000
-    ports:
-      - "3000:80"
+      REACT_APP_API_URL: http://gusto-backend:8000
+    # Нет ports — доступ только через nginx
     depends_on:
       - backend
     networks:
       - gusto-network
 
-  # Nginx Reverse Proxy
   nginx:
     image: nginx:alpine
     container_name: gusto-nginx
-    restart: unless-stopped
+    restart: always
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro  # SSL сертификаты
     depends_on:
       - backend
       - admin-panel
     networks:
       - gusto-network
 
-  # Backup Service (runs daily)
   backup:
-    image: postgres:16-alpine
+    image: postgres:15-alpine
     container_name: gusto-backup
-    restart: unless-stopped
+    restart: "no"
     environment:
-      POSTGRES_USER: ${DB_USER:-gusto}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-gusto_secret_2024}
-      POSTGRES_DB: ${DB_NAME:-gusto_vpn}
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      PGPASSWORD: ${DB_PASSWORD:-gusto_password}
     volumes:
-      - postgres_data:/backup/source:ro
       - ./backups:/backups
     command: >
       sh -c "
         while true; do
           sleep 86400;
-          PGPASSWORD=$$POSTGRES_PASSWORD pg_dump -h postgres -U $$POSTGRES_USER $$POSTGRES_DB | gzip > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql.gz;
-          find /backups -name 'backup_*.sql.gz' -mtime +$$BACKUP_RETENTION_DAYS -delete;
+          pg_dump -h postgres -U gusto -d gusto | gzip > /backups/gusto_$(date +%Y%m%d_%H%M%S).sql.gz;
+          find /backups -name '*.sql.gz' -mtime +30 -delete;
         done
       "
     depends_on:

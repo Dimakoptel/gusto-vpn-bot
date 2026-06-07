@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, and_
 
 from app.models.subscription import GustoSubscription, SubscriptionStatus
 from app.models.user import GustoUser
@@ -129,7 +129,7 @@ class SubscriptionService:
             x3ui = GustoX3UIClient(panel)
 
             # Determine inbound ID based on protocol
-            inbound_id = server.vless_inbound_id if subscription.protocol == "vless" else                         server.trojan_inbound_id if subscription.protocol == "trojan" else                         server.ss_inbound_id or 1
+            inbound_id = server.vless_inbound_id if subscription.protocol == "vless" else server.trojan_inbound_id if subscription.protocol == "trojan" else server.ss_inbound_id or 1
 
             # Create client in 3x-ui
             client_result = await x3ui.create_client(
@@ -290,8 +290,6 @@ class SubscriptionService:
 
     async def _select_server(self, country_code: str, is_premium: bool = False) -> Optional[GustoServer]:
         """Smart Router — выбор лучшего сервера"""
-        from sqlalchemy import and_, or_
-
         query = select(GustoServer).where(
             and_(
                 GustoServer.is_active == True,
@@ -314,7 +312,7 @@ class SubscriptionService:
 
         # Order by load (CPU + user ratio)
         query = query.order_by(
-            (GustoServer.cpu_load * 0.35 + 
+            (GustoServer.cpu_load * 0.35 +
              (GustoServer.total_users / GustoServer.max_users) * 0.30 +
              GustoServer.memory_used * 0.20).asc()
         )
@@ -331,18 +329,18 @@ class SubscriptionService:
         if not user or not user.referred_by:
             return
 
-        # Get referral config
-        ref_config = await ConfigService.get_many([
-            "REFERRAL_ENABLED", "REFERRAL_LEVEL_1", 
-            "REFERRAL_LEVEL_2", "REFERRAL_LEVEL_3"
-        ])
+        # Get referral config via ConfigService (async)
+        config_service = ConfigService(self.db)
+        ref_config = await config_service.get_referral_config()
 
-        if not ref_config.get("REFERRAL_ENABLED", True):
+        if not ref_config.get("enabled", True):
             return
 
+        levels = ref_config.get("levels", [0.30, 0.15, 0.05])
+
         # Process 3 levels
-        levels = [
-            (user.referred_by, float(ref_config.get("REFERRAL_LEVEL_1", 0.30))),
+        level_configs = [
+            (user.referred_by, levels[0] if len(levels) > 0 else 0.30),
         ]
 
         # Level 2
@@ -351,7 +349,7 @@ class SubscriptionService:
         )
         referrer = result.scalar_one_or_none()
         if referrer and referrer.referred_by:
-            levels.append((referrer.referred_by, float(ref_config.get("REFERRAL_LEVEL_2", 0.15))))
+            level_configs.append((referrer.referred_by, levels[1] if len(levels) > 1 else 0.15))
 
             # Level 3
             result = await self.db.execute(
@@ -359,10 +357,10 @@ class SubscriptionService:
             )
             referrer2 = result.scalar_one_or_none()
             if referrer2 and referrer2.referred_by:
-                levels.append((referrer2.referred_by, float(ref_config.get("REFERRAL_LEVEL_3", 0.05))))
+                level_configs.append((referrer2.referred_by, levels[2] if len(levels) > 2 else 0.05))
 
         # Apply commissions
-        for ref_id, percent in levels:
+        for idx, (ref_id, percent) in enumerate(level_configs):
             commission = float(payment.amount) * percent
             await self.db.execute(
                 update(GustoUser)
@@ -376,7 +374,7 @@ class SubscriptionService:
             await self.notify.referral_earned(
                 user_id=ref_id,
                 amount=commission,
-                level=levels.index((ref_id, percent)) + 1,
+                level=idx + 1,
                 from_user=payment.user_id
             )
 
@@ -456,10 +454,10 @@ class SubscriptionService:
                     download_gb = traffic.get("down", 0) / 1073741824
                     sub.used_gb = upload_gb + download_gb
 
-                    # Check IPs for antifraud
-                    ips = await x3ui.get_client_ips(sub.email)
-                    sub.unique_ips_24h = len(ips)
-                    sub.last_ip_check = datetime.utcnow()
+                # Check IPs for antifraud
+                ips = await x3ui.get_client_ips(sub.email)
+                sub.unique_ips_24h = len(ips)
+                sub.last_ip_check = datetime.utcnow()
 
                 await x3ui.close()
 

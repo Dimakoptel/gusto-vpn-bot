@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from app.models.user import GustoUser
 from app.models.server import GustoServer
+from app.services.config_service import ConfigService
 
 logger = logging.getLogger("gusto.notifications")
 
@@ -15,7 +16,6 @@ class NotificationService:
 
     async def _get_bot(self):
         """Получить экземпляр бота (singleton)"""
-        # In production, this should be injected or use a singleton
         from aiogram import Bot
         import os
         token = os.getenv("BOT_TOKEN", "")
@@ -38,8 +38,8 @@ class NotificationService:
 
     async def _send_to_admins(self, text: str, parse_mode: str = "HTML") -> None:
         """Отправить всем админам"""
-        from app.services.config_service import ConfigService
-        admin_ids = await ConfigService.get("ADMIN_IDS")
+        service = ConfigService(self.db)
+        admin_ids = await service.get_admin_ids()
         if not admin_ids:
             return
 
@@ -48,7 +48,7 @@ class NotificationService:
 
     # === User Notifications ===
 
-    async def payment_success(self, user_id: int, amount: float, plan_name: str, 
+    async def payment_success(self, user_id: int, amount: float, plan_name: str,
                               config_link: str = None, server_name: str = None) -> None:
         """Уведомление об успешной оплате"""
         result = await self.db.execute(select(GustoUser).where(GustoUser.id == user_id))
@@ -57,12 +57,12 @@ class NotificationService:
             return
 
         text = (
-            f"🎉 <b>Оплата успешна!</b>\n\n"
-            f"💰 Сумма: <b>{amount:.0f}₽</b>\n"
-            f"📦 Тариф: <b>{plan_name}</b>\n"
+            f"🎉 **Оплата успешна!**\n\n"
+            f"💰 Сумма: **{amount:.0f}₽**\n"
+            f"📦 Тариф: **{plan_name}**\n"
         )
         if server_name:
-            text += f"🌍 Сервер: <b>{server_name}</b>\n"
+            text += f"🌍 Сервер: **{server_name}**\n"
         text += "\n✅ Ваша подписка активирована!"
 
         await self._send(user.telegram_id, text)
@@ -75,14 +75,14 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"❌ <b>Оплата не удалась</b>\n\n"
+            f"❌ **Оплата не удалась**\n\n"
             f"💰 Сумма: {amount:.0f}₽\n"
             f"Причина: {reason}\n\n"
             f"Попробуйте снова или обратитесь в поддержку."
         ))
 
-    async def subscription_activated(self, user_id: int, plan_name: str, 
-                                     expires_at: str, config_link: str) -> None:
+    async def subscription_activated(self, user_id: int, plan_name: str,
+                                        expires_at: str, config_link: str) -> None:
         """Подписка активирована"""
         result = await self.db.execute(select(GustoUser).where(GustoUser.id == user_id))
         user = result.scalar_one_or_none()
@@ -90,11 +90,11 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"✅ **Подписка активирована!**\n\n"
             f"📦 Тариф: {plan_name}\n"
             f"📅 Действует до: {expires_at[:10] if len(expires_at) > 10 else expires_at}\n\n"
-            f"🔑 <b>Ваша конфигурация:</b>\n"
-            f"<code>{config_link}</code>\n\n"
+            f"🔑 **Ваша конфигурация:**\n"
+            f" `{config_link}`\n\n"
             f"Скопируйте и вставьте в приложение V2RayNG/Streisand!"
         ))
 
@@ -107,8 +107,8 @@ class NotificationService:
 
         emoji = "⚠️" if days == 1 else "⏰"
         await self._send(user.telegram_id, (
-            f"{emoji} <b>Подписка истекает через {days} {'день' if days == 1 else 'дня'}!</b>\n\n"
-            f"📧 Email: <code>{email}</code>\n\n"
+            f"{emoji} **Подписка истекает через {days} {'день' if days == 1 else 'дня'}!**\n\n"
+            f"📧 Email: `{email}`\n\n"
             f"Продлите в разделе 'Мой кабинет' → 'Продлить'"
         ))
 
@@ -120,8 +120,8 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"🔴 <b>Подписка истекла!</b>\n\n"
-            f"📧 Email: <code>{email}</code>\n\n"
+            f"🔴 **Подписка истекла!**\n\n"
+            f"📧 Email: `{email}`\n\n"
             f"Купите новую подписку в главном меню!"
         ))
 
@@ -133,13 +133,13 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"⚠️ <b>Заканчивается трафик!</b>\n\n"
-            f"📧 Email: <code>{email}</code>\n"
-            f"📊 Осталось: <b>{remaining_gb:.1f} GB</b>\n\n"
+            f"⚠️ **Заканчивается трафик!**\n\n"
+            f"📧 Email: `{email}`\n"
+            f"📊 Осталось: **{remaining_gb:.1f} GB**\n\n"
             f"Продлите подписку для добавления трафика!"
         ))
 
-    async def config_sharing_detected(self, user_id: int, email: str, 
+    async def config_sharing_detected(self, user_id: int, email: str,
                                        ips: List[str], countries: List[str]) -> None:
         """Обнаружен sharing конфига"""
         result = await self.db.execute(select(GustoUser).where(GustoUser.id == user_id))
@@ -148,15 +148,15 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"🚫 <b>Обнаружено нарушение!</b>\n\n"
-            f"📧 Email: <code>{email}</code>\n"
+            f"🚫 **Обнаружено нарушение!**\n\n"
+            f"📧 Email: `{email}`\n"
             f"🌍 Страны: {', '.join(countries)}\n"
             f"📡 IP: {len(ips)} адресов\n\n"
             f"Ваш конфиг используется слишком многими устройствами.\n"
             f"Подписка временно ограничена. Обратитесь в поддержку."
         ))
 
-    async def referral_earned(self, user_id: int, amount: float, level: int, 
+    async def referral_earned(self, user_id: int, amount: float, level: int,
                               from_user: int) -> None:
         """Реферальное начисление"""
         result = await self.db.execute(select(GustoUser).where(GustoUser.id == user_id))
@@ -166,8 +166,8 @@ class NotificationService:
 
         levels = ["🥇", "🥈", "🥉"]
         await self._send(user.telegram_id, (
-            f"💰 <b>Реферальное начисление!</b>\n\n"
-            f"{levels[level-1]} Уровень {level}: <b>+{amount:.2f}₽</b>\n"
+            f"💰 **Реферальное начисление!**\n\n"
+            f"{levels[level-1]} Уровень {level}: **+{amount:.2f}₽**\n"
             f"От пользователя: #{from_user}\n\n"
             f"Текущий баланс: {float(user.referral_balance):.2f}₽"
         ))
@@ -180,50 +180,50 @@ class NotificationService:
             return
 
         await self._send(user.telegram_id, (
-            f"💸 <b>Выплата реферальных!</b>\n\n"
-            f"Сумма: <b>{amount:.2f}₽</b>\n"
+            f"💸 **Выплата реферальных!**\n\n"
+            f"Сумма: **{amount:.2f}₽**\n"
             f"Проверьте ваш кошелек."
         ))
 
     # === Admin Notifications ===
 
-    async def admin_new_payment(self, user_id: int, amount: float, 
-                                provider: str, plan_name: str) -> None:
+    async def admin_new_payment(self, user_id: int, amount: float,
+                                 provider: str, plan_name: str) -> None:
         """Новый платеж — уведомить админов"""
         await self._send_to_admins(
-            f"💰 <b>Новый платеж!</b>\n\n"
+            f"💰 **Новый платеж!**\n\n"
             f"Пользователь: #{user_id}\n"
             f"Сумма: {amount:.0f}₽\n"
             f"Провайдер: {provider}\n"
             f"Тариф: {plan_name}"
         )
 
-    async def admin_server_offline(self, server_name: str, host: str, 
+    async def admin_server_offline(self, server_name: str, host: str,
                                     error: str) -> None:
         """Сервер недоступен — уведомить админов"""
         await self._send_to_admins(
-            f"🔴 <b>Сервер недоступен!</b>\n\n"
+            f"🔴 **Сервер недоступен!**\n\n"
             f"Имя: {server_name}\n"
             f"Хост: {host}\n"
             f"Ошибка: {error}\n\n"
             f"Проверьте сервер срочно!"
         )
 
-    async def admin_new_user(self, user_id: int, telegram_id: int, 
-                             username: str) -> None:
+    async def admin_new_user(self, user_id: int, telegram_id: int,
+                              username: str) -> None:
         """Новый пользователь — уведомить админов"""
         await self._send_to_admins(
-            f"👤 <b>Новый пользователь!</b>\n\n"
+            f"👤 **Новый пользователь!**\n\n"
             f"ID: #{user_id}\n"
             f"Telegram: {telegram_id}\n"
             f"Username: @{username or 'N/A'}"
         )
 
-    async def admin_fraud_detected(self, user_id: int, email: str, 
+    async def admin_fraud_detected(self, user_id: int, email: str,
                                     reason: str) -> None:
         """Обнаружен фрод — уведомить админов"""
         await self._send_to_admins(
-            f"🚫 <b>Обнаружен фрод!</b>\n\n"
+            f"🚫 **Обнаружен фрод!**\n\n"
             f"Пользователь: #{user_id}\n"
             f"Email: {email}\n"
             f"Причина: {reason}"

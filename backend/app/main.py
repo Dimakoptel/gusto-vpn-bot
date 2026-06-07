@@ -2,6 +2,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import os
+import logging
 
 from app.database import engine, Base, async_session_maker
 from app.routers import (
@@ -10,8 +12,9 @@ from app.routers import (
     health_router, settings_router, plans_router
 )
 from app.services.config_service import ConfigService
-from app.services.subscription_service import SubscriptionService
 from app.tasks.background_tasks import start_scheduler, stop_scheduler
+
+logger = logging.getLogger("gusto.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,9 +30,10 @@ async def lifespan(app: FastAPI):
     async with async_session_maker() as db:
         from app.routers.plans import seed_default_plans
         try:
-            await seed_default_plans(db)
-        except Exception:
-            pass  # Plans may already exist
+            result = await seed_default_plans(db)
+            logger.info(f"✅ Seeded {result['total']} default plans")
+        except Exception as e:
+            logger.warning(f"⚠️ Plan seed failed (may already exist): {e}")
 
     # Start background scheduler
     await start_scheduler()
@@ -40,6 +44,11 @@ async def lifespan(app: FastAPI):
     await stop_scheduler()
     await engine.dispose()
 
+# CORS origins from env (restricted in production)
+cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+if cors_origins == ["*"]:
+    cors_origins = ["*"]  # Development only
+
 app = FastAPI(
     title="GUSTO VPN API",
     description="Быстрый. Безопасный. Без границ. | Управление через админ-панель",
@@ -49,7 +58,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, set to your admin-panel domain
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,8 +72,8 @@ app.include_router(payments_router, prefix="/api/payments", tags=["Payments"])
 app.include_router(subscriptions_router, prefix="/api/subscriptions", tags=["Subscriptions"])
 app.include_router(referrals_router, prefix="/api/referrals", tags=["Referrals"])
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
-app.include_router(settings_router, prefix="", tags=["Settings"])
-app.include_router(health_router, prefix="", tags=["Health"])
+app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
+app.include_router(health_router, prefix="/health", tags=["Health"])
 
 @app.get("/")
 async def root():

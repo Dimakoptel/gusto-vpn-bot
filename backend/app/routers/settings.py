@@ -4,13 +4,13 @@ CRUD для SystemSettings + endpoints для админ-панели
 """
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Body
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
-from backend.app.database import get_db
-from backend.app.models.settings import SystemSettings
-from backend.app.services.config_service import ConfigService
-from backend.app.dependencies import get_current_admin
+from app.database import get_db
+from app.models.settings import SystemSettings
+from app.services.config_service import ConfigService
+from app.dependencies import get_current_admin
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
 
@@ -103,18 +103,18 @@ class SettingsResponse(BaseModel):
 
 @router.get("/", response_model=SettingsResponse)
 async def get_settings(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Получить все настройки системы"""
     service = ConfigService(db)
-    settings = service.get_settings()
+    settings = await service.get_settings()
     return settings
 
 @router.put("/", response_model=SettingsResponse)
 async def update_settings(
     data: FullSettingsUpdateSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки (любую группу или все сразу)"""
@@ -134,84 +134,84 @@ async def update_settings(
     if data.system:
         update_data.update(data.system.model_dump(exclude_unset=True))
 
-    settings = service.update_settings(update_data, admin_id=admin.id)
+    settings = await service.update_settings(update_data, admin_id=admin.id)
     return settings
 
 @router.patch("/bot", response_model=SettingsResponse)
 async def update_bot_settings(
     data: BotSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки бота"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.patch("/payments", response_model=SettingsResponse)
 async def update_payment_settings(
     data: PaymentSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки платежей"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.patch("/referral", response_model=SettingsResponse)
 async def update_referral_settings(
     data: ReferralSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки реферальной системы"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.patch("/antifraud", response_model=SettingsResponse)
 async def update_antifraud_settings(
     data: AntifraudSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки антифрода"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.patch("/notifications", response_model=SettingsResponse)
 async def update_notification_settings(
     data: NotificationSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить настройки уведомлений"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.patch("/system", response_model=SettingsResponse)
 async def update_system_settings(
     data: SystemSettingsSchema,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Обновить системные настройки"""
     service = ConfigService(db)
-    settings = service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
+    settings = await service.update_settings(data.model_dump(exclude_unset=True), admin_id=admin.id)
     return settings
 
 @router.get("/payments/{provider}/config")
 async def get_payment_provider_config(
     provider: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Получить конфигурацию конкретного платежного провайдера"""
     service = ConfigService(db)
-    config = service.get_payment_config(provider)
+    config = await service.get_payment_config(provider)
     if not config:
         raise HTTPException(status_code=404, detail="Provider not found")
     return config
@@ -219,12 +219,12 @@ async def get_payment_provider_config(
 @router.post("/payments/{provider}/test")
 async def test_payment_provider(
     provider: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin = Depends(get_current_admin)
 ):
     """Тестовый запрос к платежному провайдеру (проверка токена)"""
     service = ConfigService(db)
-    config = service.get_payment_config(provider)
+    config = await service.get_payment_config(provider)
 
     if not config.get("enabled"):
         return {"status": "disabled", "message": "Провайдер отключен"}
@@ -269,11 +269,11 @@ async def test_payment_provider(
 
 @router.get("/health")
 async def settings_health_check(
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Проверка здоровья системы (публичный endpoint)"""
     service = ConfigService(db)
-    s = service.get_settings()
+    s = await service.get_settings()
 
     return {
         "maintenance_mode": s.maintenance_mode,

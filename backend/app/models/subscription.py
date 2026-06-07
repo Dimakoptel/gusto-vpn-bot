@@ -1,17 +1,16 @@
-"""GUSTO Subscription Model"""
-from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime, Numeric, Boolean, Text, Enum
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-import enum
+"""Subscription Model — GustoSubscription"""
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, Enum
+from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from app.database import Base
-
+import enum
 
 class SubscriptionStatus(str, enum.Enum):
-    ACTIVE = "active"
-    EXPIRED = "expired"
-    SUSPENDED = "suspended"
     PENDING = "pending"
-
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
 
 class GustoSubscription(Base):
     __tablename__ = "gusto_subscriptions"
@@ -21,33 +20,30 @@ class GustoSubscription(Base):
     plan_id = Column(Integer, ForeignKey("gusto_plans.id"), nullable=False)
     server_id = Column(Integer, ForeignKey("gusto_servers.id"), nullable=False)
 
-    email = Column(String(255), unique=True, index=True)
-    uuid = Column(UUID(as_uuid=True), unique=True)
-    inbound_id = Column(Integer)
-
+    email = Column(String(255), nullable=False)
+    uuid = Column(String(36), nullable=False)
+    inbound_id = Column(Integer, default=1)
     protocol = Column(String(20), default="vless")
     security = Column(String(20), default="reality")
+    flow = Column(String(50), default="xtls-rprx-vision")
 
-    total_gb = Column(Numeric(10, 2), default=100)
-    used_gb = Column(Numeric(10, 2), default=0)
+    total_gb = Column(Float, default=100.0)
+    used_gb = Column(Float, default=0.0)
     device_limit = Column(Integer, default=3)
-    ip_limit = Column(Integer, default=0)
-
-    started_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=False)
-    status = Column(Enum(SubscriptionStatus), default=SubscriptionStatus.ACTIVE)
-
-    auto_renew = Column(Boolean, default=False)
-    renew_plan_id = Column(Integer, ForeignKey("gusto_plans.id"), nullable=True)
-
-    config_link = Column(Text)
-    config_json = Column(JSONB)
-    qr_data = Column(Text)
-
+    ip_limit = Column(Integer, default=3)
     unique_ips_24h = Column(Integer, default=0)
     last_ip_check = Column(DateTime)
 
-    user = relationship("GustoUser", back_populates="subscriptions")
-    plan = relationship("GustoPlan", foreign_keys=[plan_id])
-    server = relationship("GustoServer")
-    renew_plan = relationship("GustoPlan", foreign_keys=[renew_plan_id])
+    started_at = Column(DateTime)
+    expires_at = Column(DateTime)
+    status = Column(Enum(SubscriptionStatus), default=SubscriptionStatus.PENDING)
+
+    config_link = Column(Text)
+    config_json = Column(JSONB, default=dict)
+
+    notified_3days = Column(Boolean, default=False)
+    notified_1day = Column(Boolean, default=False)
+    notified_today = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

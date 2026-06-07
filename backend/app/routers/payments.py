@@ -119,7 +119,10 @@ async def create_payment(
 # ==================== CRYPTOBOT ====================
 async def _create_cryptobot_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
     """Создать инвойс в CryptoBot"""
-    token = await ConfigService.get("CRYPTOBOT_TOKEN")
+    service = ConfigService(db)
+    config = await service.get_payment_config("cryptobot")
+    token = config.get("token")
+
     if not token:
         raise HTTPException(status_code=400, detail="CryptoBot not configured")
 
@@ -139,31 +142,31 @@ async def _create_cryptobot_invoice(payment: GustoPayment, db: AsyncSession) -> 
             }
         )
 
-        if resp.status_code != 200:
-            payment.status = PaymentStatus.FAILED
-            await db.commit()
-            raise HTTPException(status_code=500, detail=f"CryptoBot error: {resp.text}")
-
-        data = resp.json()
-        if not data.get("ok"):
-            payment.status = PaymentStatus.FAILED
-            await db.commit()
-            raise HTTPException(status_code=500, detail=f"CryptoBot error: {data}")
-
-        result = data["result"]
-        payment.provider_payment_id = str(result["invoice_id"])
-        payment.provider_data = result
+    if resp.status_code != 200:
+        payment.status = PaymentStatus.FAILED
         await db.commit()
+        raise HTTPException(status_code=500, detail=f"CryptoBot error: {resp.text}")
 
-        return PaymentResponse(
-            id=payment.id,
-            status="pending",
-            provider="cryptobot",
-            amount=payment.amount,
-            pay_url=result["pay_url"],
-            invoice_id=str(result["invoice_id"]),
-            expires_at=result.get("expiration_date_time")
-        )
+    data = resp.json()
+    if not data.get("ok"):
+        payment.status = PaymentStatus.FAILED
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"CryptoBot error: {data}")
+
+    result = data["result"]
+    payment.provider_payment_id = str(result["invoice_id"])
+    payment.provider_data = result
+    await db.commit()
+
+    return PaymentResponse(
+        id=payment.id,
+        status="pending",
+        provider="cryptobot",
+        amount=payment.amount,
+        pay_url=result["pay_url"],
+        invoice_id=str(result["invoice_id"]),
+        expires_at=result.get("expiration_date_time")
+    )
 
 @router.post("/webhook/cryptobot")
 async def cryptobot_webhook(
@@ -172,9 +175,9 @@ async def cryptobot_webhook(
     db: AsyncSession = Depends(get_db)
 ):
     """Webhook от CryptoBot — проверка IP, активация подписки"""
-    # Verify IP (optional but recommended)
-    # if not await verify_webhook_ip(request, CRYPTOBOT_IPS):
-    #     raise HTTPException(status_code=403, detail="Unauthorized IP")
+    # Verify IP (ENABLED!)
+    if not await verify_webhook_ip(request, CRYPTOBOT_IPS):
+        raise HTTPException(status_code=403, detail="Unauthorized IP")
 
     try:
         data = await request.json()
@@ -224,8 +227,10 @@ async def cryptobot_webhook(
 # ==================== YOOKASSA ====================
 async def _create_yookassa_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
     """Создать платеж в YooKassa"""
-    shop_id = await ConfigService.get("YOOKASSA_SHOP_ID")
-    secret_key = await ConfigService.get("YOOKASSA_SECRET_KEY")
+    service = ConfigService(db)
+    config = await service.get_payment_config("yookassa")
+    shop_id = config.get("shop_id")
+    secret_key = config.get("secret_key")
 
     if not shop_id or not secret_key:
         raise HTTPException(status_code=400, detail="YooKassa not configured")
@@ -270,25 +275,25 @@ async def _create_yookassa_invoice(payment: GustoPayment, db: AsyncSession) -> P
             json=request_body
         )
 
-        if resp.status_code not in (200, 201):
-            payment.status = PaymentStatus.FAILED
-            await db.commit()
-            raise HTTPException(status_code=500, detail=f"YooKassa error: {resp.text}")
-
-        data = resp.json()
-        payment.provider_payment_id = data["id"]
-        payment.provider_data = data
+    if resp.status_code not in (200, 201):
+        payment.status = PaymentStatus.FAILED
         await db.commit()
+        raise HTTPException(status_code=500, detail=f"YooKassa error: {resp.text}")
 
-        return PaymentResponse(
-            id=payment.id,
-            status="pending",
-            provider="yookassa",
-            amount=payment.amount,
-            pay_url=data["confirmation"]["confirmation_url"],
-            invoice_id=data["id"],
-            expires_at=None
-        )
+    data = resp.json()
+    payment.provider_payment_id = data["id"]
+    payment.provider_data = data
+    await db.commit()
+
+    return PaymentResponse(
+        id=payment.id,
+        status="pending",
+        provider="yookassa",
+        amount=payment.amount,
+        pay_url=data["confirmation"]["confirmation_url"],
+        invoice_id=data["id"],
+        expires_at=None
+    )
 
 @router.post("/webhook/yookassa")
 async def yookassa_webhook(
@@ -343,8 +348,10 @@ async def yookassa_webhook(
 # ==================== FREEKASSA ====================
 async def _create_freekassa_invoice(payment: GustoPayment, db: AsyncSession) -> PaymentResponse:
     """Создать платеж в FreeKassa"""
-    fk_id = await ConfigService.get("FREEKASSA_ID")
-    fk_secret = await ConfigService.get("FREEKASSA_SECRET")
+    service = ConfigService(db)
+    config = await service.get_payment_config("freekassa")
+    fk_id = config.get("id")
+    fk_secret = config.get("secret")
 
     if not fk_id or not fk_secret:
         raise HTTPException(status_code=400, detail="FreeKassa not configured")
@@ -391,8 +398,10 @@ async def freekassa_webhook(
 
     data_dict = dict(data)
 
-    fk_id = await ConfigService.get("FREEKASSA_ID")
-    fk_secret = await ConfigService.get("FREEKASSA_SECRET")
+    service = ConfigService(db)
+    config = await service.get_payment_config("freekassa")
+    fk_id = config.get("id")
+    fk_secret = config.get("secret")
 
     # Verify signature
     amount = data_dict.get("AMOUNT", "")
@@ -508,8 +517,10 @@ async def refund_payment(
     if payment.method != PaymentMethod.YOOKASSA:
         raise HTTPException(status_code=400, detail="Refund only supported for YooKassa")
 
-    shop_id = await ConfigService.get("YOOKASSA_SHOP_ID")
-    secret_key = await ConfigService.get("YOOKASSA_SECRET_KEY")
+    service = ConfigService(db)
+    config = await service.get_payment_config("yookassa")
+    shop_id = config.get("shop_id")
+    secret_key = config.get("secret_key")
     auth = base64.b64encode(f"{shop_id}:{secret_key}".encode()).decode()
 
     async with httpx.AsyncClient() as client:
@@ -523,9 +534,9 @@ async def refund_payment(
             json={"amount": {"value": f"{float(payment.amount):.2f}", "currency": payment.currency}}
         )
 
-        if resp.status_code in (200, 201):
-            payment.status = PaymentStatus.REFUNDED
-            await db.commit()
-            return {"status": "refunded"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Refund failed: {resp.text}")
+    if resp.status_code in (200, 201):
+        payment.status = PaymentStatus.REFUNDED
+        await db.commit()
+        return {"status": "refunded"}
+    else:
+        raise HTTPException(status_code=500, detail=f"Refund failed: {resp.text}")

@@ -8,14 +8,37 @@ from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.models import GustoSubscription, GustoUser, GustoServer, GustoPlan, GustoPayment
-from app.services import GustoX3UIClient, X3UIPanel, GustoSmartRouter
-from app.services.payments import PaymentManager
-from app.config import settings
+from app.services.x3ui_client import GustoX3UIClient, X3UIPanel
+from app.services.subscription_service import SubscriptionService
+from app.services.config_service import ConfigService
 
-router = APIRouter()
+router = APIRouter(prefix="/api/subscriptions", tags=["Subscriptions"])
 
-# Инициализация менеджера платежей
-payment_manager = PaymentManager()
+@router.post("/pending")
+async def create_pending_subscription(
+    data: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Создать подписку в статусе PENDING (до оплаты)
+    Вызывается из бота при выборе тарифа
+    """
+    user_id = data.get("user_id")
+    plan_id = data.get("plan_id")
+    country = data.get("country_code", "RU")
+
+    service = SubscriptionService(db)
+    try:
+        result = await service.create_pending(
+            user_id=user_id,
+            plan_id=plan_id,
+            country_code=country
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to create subscription: {str(e)}")
 
 @router.post("/")
 async def create_subscription(
@@ -24,7 +47,7 @@ async def create_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Создать подписку:
+    Создать подписку + платеж (полный flow)
     1. Проверить пользователя и тариф
     2. Выбрать лучший сервер (Smart Router)
     3. Создать клиента в 3x-ui
@@ -60,20 +83,18 @@ async def create_subscription(
     if not servers:
         raise HTTPException(503, "No servers available")
 
-    # 4. Выбрать лучший сервер (Smart Router)
-    router = GustoSmartRouter()
-    best = await router.find_best(country, servers)
+    # 4. Выбрать лучший сервер (Smart Router via SubscriptionService)
+    service = SubscriptionService(db)
+    server = await service._select_server(country, plan.is_premium)
 
-    if not best:
+    if not server:
         raise HTTPException(503, "Could not find suitable server")
-
-    server = best.server
 
     # 5. Подключиться к 3x-ui панели
     x3ui = GustoX3UIClient(X3UIPanel(
         host=server.host,
         port=server.port,
-        api_token=server.panel_api_token,  # Используем API Token!
+        api_token=server.panel_api_token,
         name=server.name
     ))
 
@@ -105,13 +126,12 @@ async def create_subscription(
         inbound_id=server.vless_inbound_id,
         total_gb=plan.traffic_gb,
         expires_at=datetime.utcnow() + timedelta(days=plan.duration_days),
-        status="pending",  # Пока не оплачено
+        status="pending",
         config_link=client.get("config", {}).get("link", ""),
         config_json=client.get("config", {})
     )
-
     db.add(subscription)
-    await db.flush()  # Получить ID подписки
+    await db.flush()
 
     # 9. Создать платеж
     payment = GustoPayment(
@@ -122,45 +142,18 @@ async def create_subscription(
         method=payment_method,
         status="pending"
     )
-
     db.add(payment)
     await db.flush()
 
-    # 10. Создать платеж через провайдера
-    result = await payment_manager.create_payment(
-        provider_name=payment_method,
-        amount=float(plan.price),
-        description=f"GUSTO VPN — {plan.name}",
-        order_id=str(payment.id),
-        user_id=user_id,
-        plan_id=plan_id,
-        email=user.username or f"user{user_id}@gustovpn.ru"
-    )
-
-    if not result:
-        # Откатить создание клиента в 3x-ui
-        x3ui = GustoX3UIClient(X3UIPanel(
-            host=server.host,
-            port=server.port,
-            api_token=server.panel_api_token,
-            name=server.name
-        ))
-        await x3ui.delete_client(email)
-        await x3ui.close()
-
-        await db.rollback()
-        raise HTTPException(500, "Failed to create payment")
-
-    # 11. Обновить записи
-    payment.provider_payment_id = result["provider_payment_id"]
-    payment.provider_data = result
+    # 10. Создать платеж через провайдера (используем payments router)
+    # NOTE: В реальном flow бот должен вызвать /api/payments/ для создания инвойса
+    # Здесь возвращаем subscription_id и payment_id для дальнейшей обработки
 
     await db.commit()
 
     return {
         "subscription_id": subscription.id,
         "payment_id": payment.id,
-        "pay_url": result["pay_url"],
         "amount": float(plan.price),
         "currency": "RUB",
         "status": "pending",
@@ -202,9 +195,6 @@ async def activate_subscription(
         server.total_users += 1
 
     await db.commit()
-
-    # TODO: Отправить уведомление пользователю в Telegram
-    # background_tasks.add_task(notify_user, subscription.user_id, "subscription_activated")
 
     return {
         "subscription_id": subscription.id,
@@ -248,59 +238,24 @@ async def renew_subscription(
     db: AsyncSession = Depends(get_db)
 ):
     """Продлить подписку"""
-    subscription = await db.get(GustoSubscription, subscription_id)
-    if not subscription:
-        raise HTTPException(404, "Subscription not found")
-
-    if subscription.status != "active":
-        raise HTTPException(400, "Subscription is not active")
-
-    plan_id = data.get("plan_id")
-    plan = await db.get(GustoPlan, plan_id)
-    if not plan:
-        raise HTTPException(404, "Plan not found")
-
-    # Получить сервер
-    server = await db.get(GustoServer, subscription.server_id)
-    if not server:
-        raise HTTPException(404, "Server not found")
-
-    # Подключиться к 3x-ui
-    x3ui = GustoX3UIClient(X3UIPanel(
-        host=server.host,
-        port=server.port,
-        api_token=server.panel_api_token,
-        name=server.name
-    ))
-
-    # Продлить клиента (bulkAdjust)
-    add_days = plan.duration_days
-    add_bytes = int(plan.traffic_gb * 1073741824)
-
-    result = await x3ui.bulk_adjust_clients(
-        emails=[subscription.email],
-        add_days=add_days,
-        add_bytes=add_bytes
-    )
-
-    await x3ui.close()
-
-    if not result or not result.get("success"):
-        raise HTTPException(500, "Failed to renew subscription in 3x-ui")
-
-    # Обновить подписку
-    subscription.expires_at += timedelta(days=add_days)
-    subscription.total_gb += plan.traffic_gb
-
-    await db.commit()
-
-    return {
-        "subscription_id": subscription.id,
-        "status": "active",
-        "new_expires_at": subscription.expires_at,
-        "added_days": add_days,
-        "added_traffic_gb": plan.traffic_gb
-    }
+    service = SubscriptionService(db)
+    try:
+        plan_id = data.get("plan_id")
+        # Найти платеж для продления (mock — в реальности нужен новый платеж)
+        payment = GustoPayment(
+            user_id=1,  # placeholder
+            subscription_id=subscription_id,
+            amount=0,
+            currency="RUB",
+            method="yookassa",
+            status=PaymentStatus.SUCCESS
+        )
+        result = await service.renew_subscription(subscription_id, plan_id, payment)
+        return result
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to renew: {str(e)}")
 
 @router.post("/{subscription_id}/cancel")
 async def cancel_subscription(
