@@ -1,0 +1,130 @@
+version: '3.8'
+
+name: gusto-vpn
+
+services:
+  gusto-postgres:
+    image: postgres:15-alpine
+    container_name: gusto-postgres
+    environment:
+      POSTGRES_USER: ${GUSTO_DB_USER:-gusto}
+      POSTGRES_PASSWORD: ${GUSTO_DB_PASSWORD:-gusto_secret_2024}
+      POSTGRES_DB: ${GUSTO_DB_NAME:-gustovpn}
+    volumes:
+      - gusto_postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gusto-network
+
+  gusto-redis:
+    image: redis:7-alpine
+    container_name: gusto-redis
+    command: redis-server --appendonly yes --requirepass ${GUSTO_REDIS_PASSWORD:-gusto_redis}
+    volumes:
+      - gusto_redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - gusto-network
+
+  gusto-backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: gusto-backend
+    environment:
+      - GUSTO_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://${GUSTO_DB_USER:-gusto}:${GUSTO_DB_PASSWORD:-gusto_secret_2024}@gusto-postgres:5432/${GUSTO_DB_NAME:-gustovpn}
+      - REDIS_URL=redis://:${GUSTO_REDIS_PASSWORD:-gusto_redis}@gusto-redis:6379/0
+      - SECRET_KEY=${GUSTO_SECRET_KEY:-gusto_super_secret_key_change_me}
+      - BOT_TOKEN=${GUSTO_BOT_TOKEN}
+      - ADMIN_IDS=${GUSTO_ADMIN_IDS}
+      - X3UI_PANELS=${GUSTO_X3UI_PANELS}
+      - CRYPTOBOT_TOKEN=${GUSTO_CRYPTOBOT_TOKEN}
+      - YOOKASSA_SHOP_ID=${GUSTO_YOOKASSA_SHOP_ID}
+      - YOOKASSA_SECRET_KEY=${GUSTO_YOOKASSA_SECRET_KEY}
+      - FREEKASSA_ID=${GUSTO_FREEKASSA_ID}
+      - FREEKASSA_SECRET=${GUSTO_FREEKASSA_SECRET}
+      - S3_BACKUP_BUCKET=${GUSTO_S3_BUCKET}
+      - S3_BACKUP_KEY=${GUSTO_S3_KEY}
+      - S3_BACKUP_SECRET=${GUSTO_S3_SECRET}
+    volumes:
+      - ../backend:/app
+      - gusto_backups:/app/backups
+    ports:
+      - "8000:8000"
+    depends_on:
+      gusto-postgres:
+        condition: service_healthy
+      gusto-redis:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - gusto-network
+
+  gusto-bot:
+    build:
+      context: ../bot
+      dockerfile: Dockerfile
+    container_name: gusto-bot
+    environment:
+      - GUSTO_BOT_TOKEN=${GUSTO_BOT_TOKEN}
+      - GUSTO_BACKEND_URL=http://gusto-backend:8000
+      - GUSTO_REDIS_URL=redis://:${GUSTO_REDIS_PASSWORD:-gusto_redis}@gusto-redis:6379/1
+      - GUSTO_WEBHOOK_URL=${GUSTO_WEBHOOK_URL}
+    volumes:
+      - ../bot:/app
+    depends_on:
+      - gusto-backend
+      - gusto-redis
+    command: python main.py
+    networks:
+      - gusto-network
+
+  gusto-admin:
+    build:
+      context: ../admin-panel
+      dockerfile: Dockerfile
+    container_name: gusto-admin
+    ports:
+      - "3000:80"
+    depends_on:
+      - gusto-backend
+    networks:
+      - gusto-network
+
+  gusto-nginx:
+    image: nginx:alpine
+    container_name: gusto-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/ssl:/etc/nginx/ssl
+      - gusto_certbot:/etc/letsencrypt
+    depends_on:
+      - gusto-backend
+      - gusto-admin
+    networks:
+      - gusto-network
+
+volumes:
+  gusto_postgres_data:
+  gusto_redis_data:
+  gusto_backups:
+  gusto_certbot:
+
+networks:
+  gusto-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
