@@ -3,7 +3,7 @@
 
 ## Сводка изменений
 
-### Этап 1: Обновленный x3ui_client.py
+### Этап 1: Обновленный `backend/app/services/x3ui_client.py`
 **Файл:** `backend/app/services/x3ui_client.py`
 
 **Ключевые изменения:**
@@ -169,10 +169,10 @@ make dev  # или docker-compose up --build
 
 | Оригинальный файл | Новый файл | Статус |
 |-------------------|------------|--------|
-| backend/app/services/x3ui_client.py | updated_x3ui_client.py | ✅ Готов |
-| bot/main.py | updated_bot.py | ✅ Готов |
-| backend/app/routers/payments.py | updated_payments.py | ✅ Готов |
-| backend/app/routers/subscriptions.py | updated_subscriptions_router.py | ✅ Готов |
+| backend/app/services/x3ui_client.py | backend/app/services/x3ui_client.py | ✅ Готов |
+| bot/main.py | bot/main.py | ✅ Готов |
+| backend/app/routers/payments.py | backend/app/routers/payments.py | ✅ Готов |
+| backend/app/routers/subscriptions.py | backend/app/routers/subscriptions.py | ✅ Готов |
 
 ---
 

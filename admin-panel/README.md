@@ -2,7 +2,7 @@
 
 ## Что добавлено
 
-Полноценная веб-админ-панель для управления ВСЕМИ настройками проекта через интерфейс. Больше не нужно редактировать `.env` или перезапускать бота для смены токена/платежной системы.
+Полноценная веб-админ-панель для управления ВСЕМИ настройками проекта через интерфейс. Больше не нужно редактировать `.env` вручную (используйте `.env.example`) или перезапускать бота для смены токена/платежной системы.
 
 ---
 
@@ -15,7 +15,7 @@
 | `backend/app/models/settings.py` | Модель `SystemSettings` — все настройки в БД |
 | `backend/app/services/config_service.py` | Чтение/запись настроек с кэшем в Redis |
 | `backend/app/routers/settings.py` | API endpoints для CRUD настроек |
-| `admin-panel/backend_app_routers_payments_v2.py` | Платежи, читающие конфиг из SystemSettings |
+| `backend/app/routers/payments.py` | Платежи, читающие конфиг из SystemSettings |
 | `alembic/versions/001_replace_panel_creds_with_token.py` | Миграция: +`panel_api_token`, +`system_settings` |
 
 ### Frontend (Admin Panel)
@@ -142,7 +142,7 @@ GET    /api/settings/health              # Публичный health check
 
 ## Важно
 
-- **Не храните `.env` с токенами в репозитории** — теперь всё в БД
+- **Не храните секреты в репозитории** — используйте `.env.example` для примера переменных и храните реальные значения локально
 - **Сделайте бэкап `system_settings`** — это критичные данные
 - **Первый запуск**: создайте запись в `system_settings` (миграция делает это автоматически)
 - **Redis обязателен** для кэширования (уже есть в docker-compose)
@@ -153,15 +153,15 @@ GET    /api/settings/health              # Публичный health check
 
 ```bash
 # 1. Замените файлы
-cp backend/app/models/settings.py your-project/backend/app/models/
-cp backend/app/services/config_service.py your-project/backend/app/services/
-cp backend/app/routers/settings.py your-project/backend/app/routers/
-cp admin-panel/backend_app_routers_payments_v2.py your-project/backend/app/routers/payments.py
-cp alembic/versions/001_replace_panel_creds_with_token.py your-project/alembic/versions/
-cp -r admin-panel/src/views/* your-project/admin-panel/src/views/
-cp admin-panel/src/services/api.js your-project/admin-panel/src/services/
+cp backend/app/models/settings.py <your-project>/backend/app/models/
+cp backend/app/services/config_service.py <your-project>/backend/app/services/
+cp backend/app/routers/settings.py <your-project>/backend/app/routers/
+cp backend/app/routers/payments.py <your-project>/backend/app/routers/payments.py
+cp alembic/versions/001_replace_panel_creds_with_token.py <your-project>/alembic/versions/
+cp -r admin-panel/src/views/* <your-project>/admin-panel/src/views/
+cp admin-panel/src/services/api.js <your-project>/admin-panel/src/services/
 
-# 2. Обновите models/__init__.py — добавьте SystemSettings
+# 2. Обновите `backend/app/models/__init__.py` — добавьте SystemSettings
 # 3. Обновите main.py — добавьте router settings
 # 4. Запустите миграцию
 alembic upgrade head

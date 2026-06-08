@@ -30,18 +30,18 @@
 |---|----------|-------------|------|
 | **8** | Бот не загружает admin_ids из API | Добавлена загрузка из `/api/settings/health` + fallback | `bot/main.py` |
 | **9** | Webhook IP whitelist закомментирован | Включен для всех провайдеров | `payments.py` |
-| **10** | CORS `allow_origins=["*"]` | Ограничен через `CORS_ORIGINS` env | `main.py` |
-| **11** | subscriptions.py — неверные импорты | Исправлены на правильные | `subscriptions.py` |
+| **10** | CORS `allow_origins=["*"]` | Ограничен через `CORS_ORIGINS` env | `backend/app/main.py` |
+| **11** | `backend/app/routers/subscriptions.py` — неверные импорты | Исправлены на правильные | `backend/app/routers/subscriptions.py` |
 | **12** | Нет `import os` в bot/main.py | Добавлен на уровне модуля | `bot/main.py` |
-| **13** | server.py — нет `consecutive_fails` | Добавлены поля + `last_ping` + `ping_ms` | `server.py` |
+| **13** | backend/app/models/server.py — нет `consecutive_fails` | Добавлены поля + `last_ping` + `ping_ms` | `backend/app/models/server.py` |
 | **14** | Backup command | Исправлен piping + добавлен cleanup | `docker-compose.yml` |
-| **15** | admin-panel exposed на 3000 | Убраны ports (только через nginx) | `docker-compose.yml` |
-| **16** | payments.py — await ConfigService.get() | Исправлено на async инстанцирование | `payments.py` |
-| **17** | subscription_service.py — ConfigService.get_many | Исправлено на `get_referral_config()` | `subscription_service.py` |
+| **15** | admin-panel exposed на 3000 | Убраны ports — админ-панель собирается и запускается из `admin-panel/` (через nginx) | `docker-compose.yml` |
+| **16** | payments.py — await ConfigService.get() | Исправлено на async инстанцирование | `backend/app/routers/payments.py` |
+| **17** | subscription_service.py — ConfigService.get_many | Исправлено на `get_referral_config()` | `backend/app/services/subscription_service.py` |
 | **18** | bot/main.py — BackendClient не обрабатывает 401 | Добавлена обработка 401/403 | `bot/main.py` |
-| **19** | main.py — settings_router prefix="" | Добавлен `prefix="/api/settings"` | `main.py` |
-| **20** | Нет alembic.ini | Указано в README для ручного добавления | README |
-| **21** | nginx.conf — SSL | Добавлен volume + закомментирован HTTPS | `docker-compose.yml`, `nginx.conf` |
+| **19** | main.py — settings_router prefix="" | Добавлен `prefix="/api/settings"` | `backend/app/main.py` |
+| **20** | alembic.ini | Файл находится в `backend/alembic.ini` | `backend/alembic.ini` |
+| **21** | nginx.conf — SSL | Добавлен volume + закомментирован HTTPS | `docker-compose.yml`, `docker/nginx/nginx.conf` |
 
 ## 🟢 Исправленные минорные проблемы (5 шт.)
 
@@ -49,7 +49,7 @@
 |---|----------|-------------|
 | **22** | seed_default_plans — игнорирует ошибки | Добавлено логирование |
 | **23** | tests — только mock-based | Созданы новые тесты с проверками |
-| **24** | Нет .env.example | Создан с описанием всех переменных |
+| **24** | .env.example | В репозитории присутствует `.env.example` — используйте его для создания `.env` |
 | **25** | Нет requirements.txt | Созданы для backend и bot |
 | **26** | Нет admin-panel views | Созданы 6 React компонентов |
 
@@ -62,19 +62,19 @@ gusto-vpn-bot-v2-fixed/
 ├── backend/
 │   ├── app/
 │   │   ├── models/
-│   │   │   ├── __init__.py          ✅ Исправлен (GustoPlan, SystemSettings)
-│   │   │   ├── plan.py              ✅ Создан
+│   │   │   ├── backend/app/models/__init__.py          ✅ Исправлен (GustoPlan, SystemSettings)
+│   │   │   ├── backend/app/models/plan.py              ✅ Создан
 │   │   │   ├── server.py            ✅ Исправлен (+consecutive_fails, last_ping)
 │   │   │   ├── user.py              ✅ Создан
 │   │   │   ├── subscription.py       ✅ Создан
-│   │   │   ├── payment.py           ✅ Создан
+│   │   │   ├── backend/app/models/payment.py           ✅ Создан
 │   │   │   └── settings.py          ✅ Создан (SystemSettings, 30+ полей)
 │   │   ├── routers/
-│   │   │   ├── __init__.py          ✅ Исправлен (+plans_router)
+│   │   │   ├── backend/app/routers/__init__.py          ✅ Исправлен (+plans_router)
 │   │   │   ├── settings.py          ✅ Исправлен (async ConfigService)
 │   │   │   ├── payments.py          ✅ Исправлен (async + IP whitelist)
-│   │   │   ├── plans.py             ✅ Создан (seed default plans)
-│   │   │   ├── subscriptions.py      ✅ Исправлен (правильные импорты)
+│   │   │   ├── backend/app/routers/plans.py             ✅ Создан (seed default plans)
+│   │   │   ├── backend/app/routers/subscriptions.py      ✅ Исправлен (правильные импорты)
 │   │   │   ├── users.py             ✅ Создан
 │   │   │   ├── servers.py           ✅ Создан
 │   │   │   ├── referrals.py          ✅ Создан
@@ -100,15 +100,15 @@ gusto-vpn-bot-v2-fixed/
 ├── admin-panel/
 │   └── src/
 │       ├── services/
-│       │   └── api.js                ✅ Создан
+│       │   └── admin-panel/src/services/api.js                ✅ Создан
 │       └── views/
-│           ├── SettingsPage.jsx      ✅ Создан
-│           ├── BotSettings.jsx       ✅ Создан
-│           ├── PaymentSettings.jsx     ✅ Создан
-│           ├── ReferralSettings.jsx   ✅ Создан
-│           ├── AntifraudSettings.jsx  ✅ Создан
-│           ├── NotificationSettings.jsx ✅ Создан
-│           └── SystemSettings.jsx     ✅ Создан
+│           ├── admin-panel/src/views/SettingsPage.jsx      ✅ Создан
+│           ├── admin-panel/src/views/BotSettings.jsx       ✅ Создан
+│           ├── admin-panel/src/views/PaymentSettings.jsx     ✅ Создан
+│           ├── admin-panel/src/views/ReferralSettings.jsx   ✅ Создан
+│           ├── admin-panel/src/views/AntifraudSettings.jsx  ✅ Создан
+│           ├── admin-panel/src/views/NotificationSettings.jsx ✅ Создан
+│           └── admin-panel/src/views/SystemSettings.jsx     ✅ Создан
 ├── docker/
 │   └── nginx/
 │       └── nginx.conf                ✅ Создан (SSL, rate limiting)

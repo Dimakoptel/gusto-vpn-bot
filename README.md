@@ -117,20 +117,20 @@ curl http://localhost:8000/health/
 |---|----------|-------------|
 | 1 | Неверные импорты `backend.app` | Заменены на `app` |
 | 2 | ConfigService синхронный | Переписан на async |
-| 3 | Нет plans_router | Добавлен в `__init__.py` |
-| 4 | Нет модели SystemSettings | Создана полная модель |
-| 5 | Нет dependencies.py | Создан JWT auth |
+| 3 | Нет plans_router | Добавлен в `backend/app/routers/__init__.py` |
+| 4 | Нет модели SystemSettings | Создана полная модель (см. backend/app/models/settings.py) |
+| 5 | Нет `backend/app/dependencies.py` | Создан JWT auth |
 | 6 | ConfigService.get_many() не существует | Добавлен async метод |
 | 7 | NotificationService неправильно использует ConfigService | Исправлено на async |
 | 8 | Бот не загружает admin_ids из API | Добавлена загрузка из `/api/settings/health` |
 | 9 | Webhook IP whitelist закомментирован | Включен |
 | 10 | CORS `allow_origins=["*"]` | Ограничен через `.env` |
-| 11 | subscriptions.py — неверные импорты | Исправлены |
-| 12 | Нет `import os` в bot/main.py | Добавлен |
-| 13 | server.py — нет `consecutive_fails` | Добавлены поля |
+| 11 | `backend/app/routers/subscriptions.py` — неверные импорты | Исправлены |
+| 12 | Нет `import os` в `bot/main.py` | Добавлен |
+| 13 | `backend/app/models/server.py` — нет `consecutive_fails` | Добавлены поля |
 | 14 | Backup command | Исправлен |
 | 15 | admin-panel exposed на 3000 | Убраны ports |
-| 16 | Нет alembic.ini | Нужно добавить вручную |
+| 16 | `backend/alembic.ini` | Файл находится в `backend/alembic.ini` (если нужен на уровне проекта — добавьте вручную) |
 
 ## 📁 Структура проекта
 ```
@@ -141,20 +141,20 @@ gusto-vpn-bot/
 │   │   ├── routers/         # API endpoints (users, servers, plans, payments, subscriptions, referrals, admin, settings, health)
 │   │   ├── services/        # Business logic (config, subscription, notification, x3ui client)
 │   │   ├── tasks/           # Background tasks (APScheduler)
-│   │   ├── main.py          # FastAPI app + lifespan
-│   │   ├── database.py      # Async SQLAlchemy + Redis
-│   │   ├── config.py        # CoreSettings + DynamicSettingsProxy
-│   │   └── dependencies.py  # JWT auth
+│   │   ├── backend/app/main.py          # FastAPI app + lifespan
+│   │   ├── backend/app/database.py      # Async SQLAlchemy + Redis
+│   │   ├── backend/app/config.py        # CoreSettings + DynamicSettingsProxy
+│   │   └── backend/app/dependencies.py  # JWT auth
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── bot/
-│   ├── main.py              # aiogram bot + ConfigService + error handling
+│   ├── bot/main.py              # aiogram bot + ConfigService + error handling
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── admin-panel/
 │   └── src/
-│       ├── services/api.js
-│       └── views/           # 6 React компонентов настроек
+│       ├── admin-panel/src/services/api.js
+│       └── views/           # 6 React компонентов настроек (см. admin-panel/src/views/)
 ├── docker-compose.yml       # 6 сервисов
 ├── .env.example
 └── tests/test_suite.py
